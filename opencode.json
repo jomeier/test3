@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "agent-memory/rules/*.md",
+    "agent-memory/design-guidelines/*.md",
+    "agent-memory/learnings/README.md"
+  ],
+  "permissions": [
+    { "action": "edit", "resource": "agent-memory/rules/*", "effect": "ask" },
+    { "action": "edit", "resource": "agent-memory/design-guidelines/*", "effect": "ask" },
+    { "action": "edit", "resource": "agent-memory/learnings/*", "effect": "allow" }
+  ]
+}
