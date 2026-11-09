@@ -532,6 +532,15 @@ function mix(a, b, t) {
 }
 
 /**
+ * A world y far below the bottom edge of the current view.
+ * Background layers use it as their ground line so the towers and hills always
+ * run off the bottom of the screen instead of ending in mid-air.
+ */
+function belowBottom(cam, view, margin = 40) {
+  return cam.y - view.h / 2 - margin;
+}
+
+/**
  * Create the WebGL renderer for a canvas.
  * Returns { resize, draw, gl }.
  */
@@ -606,33 +615,42 @@ function createRenderer(canvas) {
     push(-1, -1, 1, 1, bottomColor, topColor);
   }
 
-  /** Draw one city building with lit windows, used for the parallax skyline. */
+  /**
+   * Draw one city building of the parallax skyline.
+   * `b.y` is the ground line of the lot, the tower is drawn down past the
+   * bottom of the screen so it never looks cut off in mid-air.
+   */
   function drawBuilding(b, cam, view, near, time) {
     // Distant buildings are hazier and lighter, the ones in front are darker.
     const color = near ? [0.16, 0.21, 0.29] : [0.24, 0.31, 0.4];
-    rect(b.x, b.y, b.w, b.h, color, cam, view);
-    rect(b.x + b.w * 0.08, b.y + b.h, b.w * 0.84, 0.5, mix(color, [1, 1, 1], 0.1), cam, view);
+    const top = b.y + b.h;
+    const base = belowBottom(cam, view);
+
+    rect(b.x, base, b.w, top - base, color, cam, view);
+    rect(b.x + b.w * 0.08, top, b.w * 0.84, 0.5, mix(color, [1, 1, 1], 0.1), cam, view);
 
     const cols = Math.max(1, Math.floor(b.w / 1.4));
-    const rows = Math.max(1, Math.min(10, Math.floor(b.h / 1.7)));
+    // Rows are counted from the roof downwards; rows below the view are dropped
+    // by the visibility test inside rect(), so they cost nothing.
+    const rows = Math.max(1, Math.min(16, Math.floor((top - base) / 1.7)));
     const litChance = near ? 0.6 : 0.3;
 
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
-        const base = hash(b.id * 97 + r, c);
+        const seed = hash(b.id * 97 + r, c);
         // A few windows blink over time so the city looks alive.
-        const blink = base > 0.88 && Math.floor(time * 1.5 + b.id + r) % 2 === 0;
-        const lit = base < litChance || blink;
+        const blink = seed > 0.88 && Math.floor(time * 1.5 + b.id + r) % 2 === 0;
+        const lit = seed < litChance || blink;
         const windowColor = lit ? (near ? [0.93, 0.78, 0.38] : [0.62, 0.68, 0.55]) : mix(color, [0, 0, 0], 0.3);
-        rect(b.x + 0.35 + c * 1.4, b.y + 0.5 + r * 1.7, 0.7, 0.9, windowColor, cam, view);
+        rect(b.x + 0.35 + c * 1.4, top - 1.2 - r * 1.7, 0.7, 0.9, windowColor, cam, view);
       }
     }
 
     if (near && hash(b.id, 17) > 0.6) {
-      rect(b.x + b.w * 0.45, b.y + b.h + 0.5, 0.2, 1.8, [0.36, 0.42, 0.5], cam, view);
+      rect(b.x + b.w * 0.45, top + 0.5, 0.2, 1.8, [0.36, 0.42, 0.5], cam, view);
     }
     if (near && hash(b.id, 29) > 0.7) {
-      rect(b.x - 0.6, b.y + b.h * 0.5, 0.6, 0.5, [0.3, 0.36, 0.44], cam, view); // side tower
+      rect(b.x - 0.6, top - b.h * 0.5, 0.6, 0.5, [0.3, 0.36, 0.44], cam, view); // side tower
     }
   }
 
@@ -741,11 +759,12 @@ function createRenderer(canvas) {
 
     // Far city skyline and distant hills (slow parallax).
     const farCam = { x: cam.x * 0.22, y: cam.y * 0.12 };
+    const farBase = belowBottom(farCam, view);
     for (const b of world.buildings) {
       if (b.layer === 0) drawBuilding(b, farCam, view, false, time);
     }
     for (const hill of world.hills) {
-      rect(hill.x, hill.y, hill.w, hill.h * 0.5, [0.2, 0.28, 0.36], farCam, view);
+      rect(hill.x, farBase, hill.w, hill.y + hill.h * 0.5 - farBase, [0.2, 0.28, 0.36], farCam, view);
     }
 
     // Nearer city layer (faster parallax than the far one).
