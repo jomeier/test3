@@ -10,4 +10,6 @@ Index of all learning files. Format per entry:
 
 - [Chrome refuses ES modules opened from file://](chrome-file-url-modules-not-loaded.md) — Keywords: ES modules, file://, Chrome, standalone build, CORS (verified, 2026-11-09)
 
+- [Renderer helpers cannot read the frame time from draw()](renderer-helper-missing-frame-time.md) — Keywords: WebGL, renderer, closure, scope, frame time, animation (verified, 2026-11-09)
+
 New files start from `_template.md`. Do not list `_template.md` here.

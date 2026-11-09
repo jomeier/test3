@@ -6,6 +6,10 @@ JavaScript and raw WebGL (no libraries, no build step).
 - The world is generated procedurally, chunk by chunk, while the player moves.
 - Enemies patrol back and forth on the platforms.
 - Jump on an enemy from above to defeat it, touch it from the side and you lose a life.
+- A two-layer city skyline with lit, blinking windows and distant hills moves
+  behind the level with a parallax effect.
+- Platforms are textured (grass blades, brick mortar), and bushes, trees,
+  flowers and street lamps decorate them.
 
 ## Run it
 
