@@ -35,3 +35,13 @@ export function pick(rng, items) {
 export function clamp(value, min, max) {
   return value < min ? min : value > max ? max : value;
 }
+
+/**
+ * Return a deterministic float in [0, 1) from two integers.
+ * Used for detail patterns (bricks, windows) without storing extra data.
+ */
+export function hash(a, b) {
+  let h = (Math.imul(a | 0, 374761393) + Math.imul(b | 0, 668265263)) >>> 0;
+  h = Math.imul(h ^ (h >>> 15), 2246822519) >>> 0;
+  return ((h ^ (h >>> 13)) >>> 0) / 4294967296;
+}
