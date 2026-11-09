@@ -49,6 +49,11 @@
         color: var(--accent);
       }
 
+      .alert {
+        color: #ff7a5c;
+        font-weight: 600;
+      }
+
       #help {
         position: fixed;
         right: 12px;
@@ -82,6 +87,15 @@
       #overlay.hidden {
         display: none;
       }
+
+      #credits {
+        position: fixed;
+        left: 12px;
+        bottom: 10px;
+        color: rgba(232, 241, 245, 0.55);
+        font-size: 11px;
+        max-width: 640px;
+      }
     </style>
   </head>
   <body>
@@ -92,6 +106,8 @@
       <span>Lives <b id="lives">3</b></span>
       <span>Stomped enemies <b id="enemies">0</b></span>
       <span>Distance <b id="distance">0</b></span>
+      <span>Bombs <b id="bombs">0</b></span>
+      <span id="alert" class="alert"></span>
       <span>Seed <b id="seed">1234</b></span>
       <span id="status">starting…</span>
     </div>
@@ -99,9 +115,13 @@
     <div id="help">
       <kbd>A</kbd> / <kbd>D</kbd> run &nbsp; <kbd>Space</kbd> or <kbd>W</kbd> jump &nbsp;
       <kbd>S</kbd> fast-fall &nbsp; <kbd>R</kbd> new world
+      <br />
+      Jets drop bombs: leave the flashing marker before it hits.
     </div>
 
     <div id="overlay" class="hidden"></div>
+
+    <div id="credits" aria-label="Texture credits"></div>
 
     <script>
 /* ---- src/prng.js ---- */
@@ -499,31 +519,432 @@ function inView(box, cam, view) {
   return box.x < right && box.x + box.w > left && box.y < top && box.y + box.h > bottom;
 }
 
+/* ---- src/jets.js ---- */
+// Purpose: Handle the jet fighters that cross the sky every few seconds and
+// drop a bomb over the player - spawning, the drop, the fall and the explosion
+// when a bomb hits solid ground. Pure maths, so it can be tested without a
+// browser.
+
+
+
+
+const FIRST_JET = 4; // seconds before the first jet appears
+const JET_MIN_GAP = 4; // shortest pause between two jets
+const JET_MAX_GAP = 8; // longest pause between two jets
+const JET_HEIGHT = 9; // flying height above the player
+const JET_SPAWN_DISTANCE = 20; // how far off screen a jet enters
+const JET_W = 3.4;
+const JET_H = 1.1;
+const BOMB_WARNING = 1.5; // seconds between the drop and the impact
+const BLAST_RADIUS = 3.2; // how far the explosion reaches
+const BLAST_DURATION = 0.6; // how long the fireball is drawn
+const MIN_DROP = 4; // smallest distance a bomb is made to fall
+
+/** Create the threat state (jets, bombs, explosions) for one run. */
+function createThreats(seed) {
+  return {
+    rng: makeRng((seed ^ 0x9e3779b9) >>> 0),
+    nextId: 0,
+    nextJet: FIRST_JET,
+    jets: [],
+    bombs: [],
+    blasts: [],
+  };
+}
+
+/**
+ * Highest platform surface directly below (x, fromY), or null when there is no
+ * ground under that column - then the bomb falls into the void.
+ */
+function surfaceBelow(world, x, fromY) {
+  let best = null;
+  for (const plat of world.platforms) {
+    if (x < plat.x || x > plat.x + plat.w) continue;
+    if (plat.top >= fromY) continue;
+    if (best === null || plat.top > best) best = plat.top;
+  }
+  return best;
+}
+
+/**
+ * Advance jets, bombs and explosions by dt seconds.
+ * Returns events so the caller can react: jetSpawned, bombDropped, exploded,
+ * playerHit, enemiesKilled.
+ */
+function stepThreats(threats, world, player, dt, time) {
+  const events = {
+    jetSpawned: false,
+    bombDropped: false,
+    exploded: 0,
+    playerHit: false,
+    enemiesKilled: 0,
+  };
+
+  // A new jet appears every few seconds, from the left or from the right.
+  if (time >= threats.nextJet) {
+    const dir = threats.rng() < 0.5 ? 1 : -1;
+    threats.jets.push({
+      id: threats.nextId++,
+      x: player.x - dir * JET_SPAWN_DISTANCE,
+      y: player.y + JET_HEIGHT,
+      dir,
+      speed: range(threats.rng, 13, 18),
+      w: JET_W,
+      h: JET_H,
+      dropped: false,
+    });
+    threats.nextJet = time + range(threats.rng, JET_MIN_GAP, JET_MAX_GAP);
+    events.jetSpawned = true;
+  }
+
+  for (const jet of threats.jets) {
+    jet.x += jet.dir * jet.speed * dt;
+
+    // The bomb is released the moment the jet is exactly above the player, so
+    // the player can see it coming and has BOMB_WARNING seconds to escape.
+    if (!jet.dropped) {
+      const jetCenter = jet.x + jet.w / 2;
+      const playerCenter = player.x + player.w / 2;
+      if (Math.abs(jetCenter - playerCenter) < 0.9) {
+        const targetY = surfaceBelow(world, jetCenter, jet.y);
+        // The fall is measured from the jet, so it may pass through the player
+        // or the decor on the way down; only the blast itself is dangerous.
+        const drop = targetY === null ? MIN_DROP : jet.y - targetY;
+        // Gravity is picked so the bomb reaches the ground after exactly
+        // BOMB_WARNING seconds, which keeps the warning window predictable.
+        // Very short drops use MIN_DROP so the bomb never floats unnaturally.
+        threats.bombs.push({
+          id: jet.id,
+          x: jetCenter,
+          y: jet.y,
+          vy: 0,
+          g: (2 * Math.max(MIN_DROP, drop)) / (BOMB_WARNING * BOMB_WARNING),
+          targetY,
+          w: 0.55,
+          h: 0.8,
+          droppedAt: time,
+        });
+        jet.dropped = true;
+        events.bombDropped = true;
+      }
+    }
+  }
+
+  // Remove jets that have flown out of the world.
+  threats.jets = threats.jets.filter((jet) => Math.abs(jet.x - player.x) < 45);
+
+  // Bombs fall straight down and explode on the first solid surface.
+  for (const bomb of threats.bombs) {
+    bomb.vy -= bomb.g * dt;
+    bomb.y += bomb.vy * dt;
+
+    if (bomb.targetY !== null && bomb.y <= bomb.targetY) {
+      bomb.y = bomb.targetY;
+      explode(threats, world, player, bomb, time, events);
+      bomb.dead = true;
+    } else if (bomb.y < world.lowestTop - 30) {
+      bomb.dead = true; // fell into the void without a blast
+    }
+  }
+  threats.bombs = threats.bombs.filter((b) => !b.dead);
+
+  // Explosions fade out after BLAST_DURATION seconds.
+  threats.blasts = threats.blasts.filter((blast) => time - blast.start < blast.duration);
+
+  return events;
+}
+
+/**
+ * Create the fireball and damage everything inside the blast radius.
+ * Exported so the tests can call it directly.
+ */
+function explode(threats, world, player, bomb, time, events) {
+  threats.blasts.push({
+    x: bomb.x,
+    y: bomb.targetY,
+    start: time,
+    radius: BLAST_RADIUS,
+    duration: BLAST_DURATION,
+  });
+  events.exploded += 1;
+
+  const px = player.x + player.w / 2;
+  const py = player.y + player.h / 2;
+  if (distance(px, py, bomb.x, bomb.y) <= BLAST_RADIUS) events.playerHit = true;
+
+  for (const enemy of world.enemies) {
+    if (!enemy.alive) continue;
+    if (distance(enemy.x + enemy.w / 2, enemy.y + enemy.h / 2, bomb.x, bomb.y) <= BLAST_RADIUS) {
+      enemy.alive = false;
+      enemy.squash = 1;
+      events.enemiesKilled += 1;
+    }
+  }
+}
+
+/** Distance between two points. */
+function distance(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/* ---- src/moon.js ---- */
+// Purpose: Compute where the moon sits in the sky. It rises on the left in an
+// arc, stands still for a moment at the top centre, then sets on the right,
+// and starts again. Pure maths, so the path can be tested without a browser.
+
+const MOON_RISE = 10; // seconds to climb from the left horizon to the top
+const MOON_HOLD = 3; // seconds the moon stays at the highest point
+const MOON_SET = 10; // seconds to sink down to the right horizon
+const MOON_CYCLE = MOON_RISE + MOON_HOLD + MOON_SET;
+
+const MOON_RADIUS = 0.1; // half width of the disc in clip space (-1..1)
+
+const HORIZON = -1.1; // clip-space height where the moon is fully off screen
+const TOP = 0.72; // clip-space height at the highest point (below the HUD bar)
+const LEFT = -1.2; // clip-space x of the rising moon
+const RIGHT = 1.2; // clip-space x of the setting moon
+
+/**
+ * Position of the moon centre in clip space at a given time.
+ * Returns { x, y, altitude, phase } with altitude 0 at the horizon and 1 at the
+ * top, so the renderer can dim the moon near the horizon.
+ */
+function moonPosition(time) {
+  const cycle = ((time % MOON_CYCLE) + MOON_CYCLE) % MOON_CYCLE;
+
+  if (cycle < MOON_RISE) {
+    // Rising: 2t - t^2 is steep at the start and flattens as it reaches the top.
+    const t = cycle / MOON_RISE;
+    const altitude = 2 * t - t * t;
+    return { x: LEFT + (0 - LEFT) * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "rise" };
+  }
+
+  if (cycle < MOON_RISE + MOON_HOLD) {
+    return { x: 0, y: TOP, altitude: 1, phase: "high" };
+  }
+
+  // Setting: mirror image of the rise, so the arc is symmetric.
+  const t = (cycle - MOON_RISE - MOON_HOLD) / MOON_SET;
+  const altitude = 1 - t * t;
+  return { x: RIGHT * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "set" };
+}
+
+/**
+ * Colour of the moon for a given altitude: warm and dim near the horizon,
+ * bright and pale when it is high in the sky.
+ */
+function moonTint(altitude) {
+  const t = Math.max(0, Math.min(1, altitude));
+  return [0.62 + 0.38 * t, 0.52 + 0.44 * t, 0.42 + 0.52 * t];
+}
+
+/* ---- src/textures.js ---- */
+// Purpose: Load a few real photo textures from the internet (Wikimedia
+// Commons) and turn them into square RGBA pixel buffers WebGL can upload. If a
+// download fails, a small procedural pattern is generated instead so the game
+// still looks good without a network connection.
+
+
+
+const TEXTURE_SIZE = 512; // power of two, so WebGL 1 may tile it (REPEAT)
+
+/** The three textures the renderer uses. Kept small on purpose. */
+const TEXTURES = [
+  {
+    name: "moon",
+    url: "https://upload.wikimedia.org/wikipedia/commons/0/01/Phase-180.jpg",
+    credit: "Moon photo: Jay Tanner, CC BY-SA 3.0 (Wikimedia Commons)",
+  },
+  {
+    name: "brick",
+    url: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Surfaces_brick_wall_with_mortar_closeup_view.JPG",
+    credit: "Brick wall: Tomwsulcer, CC0 (Wikimedia Commons)",
+  },
+  {
+    name: "wood",
+    url: "https://upload.wikimedia.org/wikipedia/commons/6/6d/Wood_planks_-_Preview_%28Amal_Kumar_via_Poly_Haven%29.webp",
+    credit: "Wood planks: Amal Kumar via Poly Haven, CC0 (Wikimedia Commons)",
+  },
+];
+
+/** RGB colour of one pixel of the procedural stand-in pattern. */
+function pattern(name, x, y, size) {
+  if (name === "brick") {
+    const rowH = 32;
+    const brickW = 64;
+    const row = Math.floor(y / rowH);
+    const offset = row % 2 === 0 ? 0 : brickW / 2;
+    if (y % rowH < 2 || (x + offset) % brickW < 2) return [135, 135, 128]; // mortar
+    const shade =
+      (0.85 + 0.3 * hash(Math.floor((x + offset) / brickW), row)) * (0.94 + 0.12 * hash(x, y));
+    return [Math.round(140 * shade), Math.round(92 * shade), Math.round(72 * shade)];
+  }
+
+  if (name === "wood") {
+    const plank = 64;
+    const row = Math.floor(y / plank);
+    if (y % plank < 2) return [58, 42, 30]; // gap between planks
+    const shade = (0.8 + 0.3 * hash(row, 5)) * (0.9 + 0.2 * hash(Math.floor(x / 3), row * 13));
+    return [Math.round(150 * shade), Math.round(120 * shade), Math.round(88 * shade)];
+  }
+
+  // moon: pale grey rock with a handful of darker craters
+  const nx = (x + 0.5) / size;
+  const ny = (y + 0.5) / size;
+  let shade = 0.78 + 0.12 * hash(Math.floor(x / 6), Math.floor(y / 6));
+  for (let i = 0; i < 8; i++) {
+    const cx = hash(i, 3);
+    const cy = hash(i, 7);
+    const r = 0.05 + hash(i, 11) * 0.08;
+    const d = Math.sqrt((nx - cx) * (nx - cx) + (ny - cy) * (ny - cy));
+    if (d < r) shade -= 0.22 * (1 - d / r);
+  }
+  return [Math.round(248 * shade), Math.round(250 * shade), Math.round(238 * shade)];
+}
+
+/** Build a size x size RGBA buffer for one texture without any network access. */
+function fallbackPixels(name, size = TEXTURE_SIZE) {
+  const pixels = new Uint8Array(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const [r, g, b] = pattern(name, x, y, size);
+      pixels[i] = r;
+      pixels[i + 1] = g;
+      pixels[i + 2] = b;
+      pixels[i + 3] = 255;
+    }
+  }
+  return pixels;
+}
+
+/**
+ * Download an image and cut its centre square into a size x size RGBA buffer.
+ * Throws when the network or the image decoder is not available.
+ */
+async function fetchPixels(url, size = TEXTURE_SIZE) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error("HTTP " + response.status);
+
+  const blob = await response.blob();
+  if (typeof createImageBitmap !== "function") throw new Error("no image decoder");
+
+  const image = await createImageBitmap(blob);
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+
+  const ctx = canvas.getContext("2d");
+  const side = Math.min(image.width, image.height);
+  ctx.drawImage(
+    image,
+    Math.floor((image.width - side) / 2),
+    Math.floor((image.height - side) / 2),
+    side,
+    side,
+    0,
+    0,
+    size,
+    size
+  );
+
+  if (typeof image.close === "function") image.close();
+  return new Uint8Array(ctx.getImageData(0, 0, size, size).data);
+}
+
+/**
+ * Load every texture. Each entry carries the pixel buffer plus ok/source so the
+ * HUD can tell a real photo from the procedural stand-in.
+ */
+async function loadTextures() {
+  const loaded = [];
+
+  for (const texture of TEXTURES) {
+    try {
+      loaded.push({ ...texture, ok: true, source: "internet", size: TEXTURE_SIZE, pixels: await fetchPixels(texture.url) });
+    } catch (error) {
+      loaded.push({
+        ...texture,
+        ok: false,
+        source: "fallback",
+        error: error.message,
+        size: TEXTURE_SIZE,
+        pixels: fallbackPixels(texture.name),
+      });
+    }
+  }
+
+  return loaded;
+}
+
 /* ---- src/renderer.js ---- */
 // Purpose: Render the game world with WebGL (raw WebGL 1, no libraries) by
-// batching every visible box into a single triangle buffer per frame, and add
-// procedural textures (grass, bricks, windows, bushes) for a richer look.
+// batching every visible box into a single triangle buffer per frame, add
+// procedural detail (grass, mortar lines, windows, bushes) and draw the few
+// real photo textures (moon, brick, wood) that src/textures.js loads.
+
+
 
 
 
 
 const MAX_QUADS = 15000;
-const FLOATS_PER_VERTEX = 5; // x, y, r, g, b
+const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
+
+const MAX_TEX_QUADS = 4000;
+const TEX_FLOATS_PER_VERTEX = 7; // x, y, u, v, r, g, b
 
 const VERTEX_SOURCE = `
 attribute vec2 pos;
 attribute vec3 color;
+attribute float alpha;
 varying vec3 vcolor;
+varying float valpha;
 void main() {
   vcolor = color;
+  valpha = alpha;
   gl_Position = vec4(pos, 0.0, 1.0);
 }`;
 
 const FRAGMENT_SOURCE = `
 precision mediump float;
 varying vec3 vcolor;
+varying float valpha;
 void main() {
-  gl_FragColor = vec4(vcolor, 1.0);
+  gl_FragColor = vec4(vcolor, valpha);
+}`;
+
+const TEX_VERTEX_SOURCE = `
+attribute vec2 pos;
+attribute vec2 uv;
+attribute vec3 color;
+varying vec2 vuv;
+varying vec3 vcolor;
+void main() {
+  vuv = uv;
+  vcolor = color;
+  gl_Position = vec4(pos, 0.0, 1.0);
+}`;
+
+// A photo is multiplied into the flat game colour, so a texture never clashes
+// with the palette. `disc` turns a quad into a circle with a soft edge.
+const TEX_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vuv;
+varying vec3 vcolor;
+uniform sampler2D tex;
+uniform float disc;
+void main() {
+  vec4 photo = texture2D(tex, vuv);
+  vec3 color = mix(photo.rgb, vcolor, 0.35);
+  float mask = 1.0;
+  if (disc > 0.5) {
+    float d = distance(vuv, vec2(0.5, 0.5));
+    mask = smoothstep(0.5, 0.42, d);
+  }
+  gl_FragColor = vec4(color, photo.a * mask);
 }`;
 
 /** Blend two rgb colors, t = 0 returns a, t = 1 returns b. */
@@ -541,24 +962,130 @@ function belowBottom(cam, view, margin = 40) {
 }
 
 /**
+ * Texture coordinates for a world box.
+ * `scale` is the number of world units one photo tile covers. The uv values may
+ * only depend on the world position, never on the camera, otherwise the photo
+ * slides over the platform every time the camera moves (for example when the
+ * player jumps). World y grows upwards while row 0 of the image is at the top,
+ * so v is negated.
+ */
+function textureUV(x, y, w, h, scale) {
+  return {
+    u1: x / scale,
+    v1: -y / scale,
+    u2: (x + w) / scale,
+    v2: -(y + h) / scale,
+  };
+}
+
+/**
+ * Build the six vertices of one textured quad in clip space:
+ * [x, y, u, v] per vertex, two triangles covering the box.
+ * The clip positions follow the camera, the uv values follow the world only.
+ */
+function texturedQuad(x, y, w, h, cam, view, scale) {
+  const uv = textureUV(x, y, w, h, scale);
+  const x1 = ((x - cam.x) * 2) / view.w;
+  const y1 = ((y - cam.y) * 2) / view.h;
+  const x2 = ((x + w - cam.x) * 2) / view.w;
+  const y2 = ((y + h - cam.y) * 2) / view.h;
+
+  return [
+    [x1, y1, uv.u1, uv.v1],
+    [x2, y1, uv.u2, uv.v1],
+    [x1, y2, uv.u1, uv.v2],
+    [x1, y2, uv.u1, uv.v2],
+    [x2, y1, uv.u2, uv.v1],
+    [x2, y2, uv.u2, uv.v2],
+  ];
+}
+
+/**
  * Create the WebGL renderer for a canvas.
- * Returns { resize, draw, gl }.
+ * Returns { resize, draw, setTextures, gl }.
  */
 function createRenderer(canvas) {
   const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
   if (!gl) throw new Error("WebGL is not available in this browser.");
 
-  const program = buildProgram(gl);
+  const program = buildProgram(gl, VERTEX_SOURCE, FRAGMENT_SOURCE);
   gl.useProgram(program);
   const posLoc = gl.getAttribLocation(program, "pos");
   const colorLoc = gl.getAttribLocation(program, "color");
+  const alphaLoc = gl.getAttribLocation(program, "alpha");
+
+  const texProgram = buildProgram(gl, TEX_VERTEX_SOURCE, TEX_FRAGMENT_SOURCE);
+  const texPosLoc = gl.getAttribLocation(texProgram, "pos");
+  const texUvLoc = gl.getAttribLocation(texProgram, "uv");
+  const texColorLoc = gl.getAttribLocation(texProgram, "color");
+  const texSampler = gl.getUniformLocation(texProgram, "tex");
+  const texDisc = gl.getUniformLocation(texProgram, "disc");
+
+  // Overlapping quads (glow, clouds, the moon) blend instead of hiding each other.
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
   const data = new Float32Array(MAX_QUADS * 6 * FLOATS_PER_VERTEX);
   const buffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
 
+  const texData = new Float32Array(MAX_TEX_QUADS * 6 * TEX_FLOATS_PER_VERTEX);
+  const texBuffer = gl.createBuffer();
+
+  const textures = new Map(); // texture name -> WebGL texture
+  let texName = null; // texture of the batch currently being collected
+  let discMask = false; // the current textured batch is a circular disc
+
   let quads = 0;
   let count = 0; // number of floats written into `data`
+  let texQuads = 0;
+  let texCount = 0; // number of floats written into `texData`
+  let drawnQuads = 0; // quads actually sent to the GPU this frame
+
+  /** Upload and draw the flat quads collected so far. */
+  function flushFlat() {
+    if (quads === 0) return;
+
+    gl.useProgram(program);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, count), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(posLoc);
+    gl.enableVertexAttribArray(colorLoc);
+    gl.enableVertexAttribArray(alphaLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 0);
+    gl.vertexAttribPointer(colorLoc, 3, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 2 * 4);
+    gl.vertexAttribPointer(alphaLoc, 1, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 5 * 4);
+    gl.drawArrays(gl.TRIANGLES, 0, quads * 6);
+
+    drawnQuads += quads;
+    quads = 0;
+    count = 0;
+  }
+
+  /** Upload and draw the textured quads that use the same photo. */
+  function flushTex() {
+    if (texQuads === 0) return;
+
+    gl.useProgram(texProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, texData.subarray(0, texCount), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(texPosLoc);
+    gl.enableVertexAttribArray(texUvLoc);
+    gl.enableVertexAttribArray(texColorLoc);
+    gl.vertexAttribPointer(texPosLoc, 2, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 0);
+    gl.vertexAttribPointer(texUvLoc, 2, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 2 * 4);
+    gl.vertexAttribPointer(texColorLoc, 3, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 4 * 4);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures.get(texName));
+    gl.uniform1i(texSampler, 0);
+    gl.uniform1f(texDisc, discMask ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, texQuads * 6);
+
+    drawnQuads += texQuads;
+    texQuads = 0;
+    texCount = 0;
+  }
 
   /** Set the canvas pixel size to its display size times the device scale. */
   function resize(cssWidth, cssHeight, scale) {
@@ -569,15 +1096,44 @@ function createRenderer(canvas) {
     gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
-  /** Append 6 vertices (2 triangles) to the batch. */
-  function push(x1, y1, x2, y2, cBottom, cTop) {
+  /** Upload the RGBA pixel buffers of the loaded textures to the GPU. */
+  function setTextures(list) {
+    for (const item of list) {
+      if (!item.pixels) continue;
+
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        item.size,
+        item.size,
+        0,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        item.pixels
+      );
+      // 512 is a power of two, so tiling with REPEAT is allowed in WebGL 1.
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+      textures.set(item.name, texture);
+    }
+    return [...textures.keys()];
+  }
+
+  /** Append 6 vertices (2 triangles) to the flat batch. */
+  function push(x1, y1, x2, y2, cBottom, cTop, alpha = 1) {
     const corners = [
-      [x1, y1, cBottom],
-      [x2, y1, cBottom],
-      [x1, y2, cTop],
-      [x1, y2, cTop],
-      [x2, y1, cBottom],
-      [x2, y2, cTop],
+      [x1, y1, cBottom, alpha],
+      [x2, y1, cBottom, alpha],
+      [x1, y2, cTop, alpha],
+      [x1, y2, cTop, alpha],
+      [x2, y1, cBottom, alpha],
+      [x2, y2, cTop, alpha],
     ];
     for (const c of corners) {
       data[count++] = c[0];
@@ -585,15 +1141,30 @@ function createRenderer(canvas) {
       data[count++] = c[2][0];
       data[count++] = c[2][1];
       data[count++] = c[2][2];
+      data[count++] = c[3];
     }
     quads += 1;
+  }
+
+  /** Append 6 vertices (2 triangles) to the textured batch. */
+  function pushTexQuad(verts, color) {
+    for (const v of verts) {
+      texData[texCount++] = v[0];
+      texData[texCount++] = v[1];
+      texData[texCount++] = v[2];
+      texData[texCount++] = v[3];
+      texData[texCount++] = color[0];
+      texData[texCount++] = color[1];
+      texData[texCount++] = color[2];
+    }
+    texQuads += 1;
   }
 
   /**
    * Draw a box given in world coordinates, using `cam` for the view transform
    * (a scaled camera is used for parallax layers).
    */
-  function rect(x, y, w, h, color, cam, view, topColor) {
+  function rect(x, y, w, h, color, cam, view, topColor, alpha = 1) {
     if (quads >= MAX_QUADS) return;
     if (!inView({ x, y, w, h }, cam, view)) return;
 
@@ -601,18 +1172,82 @@ function createRenderer(canvas) {
     const y1 = ((y - cam.y) * 2) / view.h;
     const x2 = ((x + w - cam.x) * 2) / view.w;
     const y2 = ((y + h - cam.y) * 2) / view.h;
-    push(x1, y1, x2, y2, color, topColor || color);
+    push(x1, y1, x2, y2, color, topColor || color, alpha);
   }
 
   /** Draw a box directly in clip space (-1..1) for the fixed sky layer. */
-  function rectClip(x, y, w, h, color) {
+  function rectClip(x, y, w, h, color, alpha = 1) {
     if (quads >= MAX_QUADS) return;
-    push(x, y, x + w, y + h, color, color);
+    push(x, y, x + w, y + h, color, color, alpha);
+  }
+
+  /**
+   * Draw a box with a real photo texture. `scale` is the number of world units
+   * one texture tile covers. Returns false when the texture is not loaded, so
+   * the caller can fall back to a flat colour.
+   */
+  function rectTex(x, y, w, h, tint, cam, view, name, scale) {
+    if (!textures.has(name) || quads >= MAX_QUADS) return false;
+    if (!inView({ x, y, w, h }, cam, view)) return false;
+
+    // A batch can only carry one texture, so switch by flushing the old one.
+    if (texQuads >= MAX_TEX_QUADS || (texName !== null && texName !== name)) flushTex();
+    texName = name;
+    discMask = false;
+
+    // The clip positions move with the camera, the uv values stay in world
+    // space, so the photo never slides when the player jumps.
+    pushTexQuad(texturedQuad(x, y, w, h, cam, view, scale), tint);
+    return true;
+  }
+
+  /** Draw one photo-textured circle in clip space with a soft edge. */
+  function discTex(cx, cy, radius, tint, name) {
+    if (!textures.has(name) || texQuads >= MAX_TEX_QUADS) return;
+    if (texQuads > 0 && texName !== name) flushTex();
+
+    texName = name;
+    discMask = true;
+
+    // A square in clip space is stretched on a wide screen, so the height is
+    // multiplied by the aspect ratio to keep the disc round on the display.
+    const aspect = canvas.width / canvas.height;
+    pushTexQuad(
+      [
+        [cx - radius, cy - radius * aspect, 0, 1],
+        [cx + radius, cy - radius * aspect, 1, 1],
+        [cx - radius, cy + radius * aspect, 0, 0],
+        [cx - radius, cy + radius * aspect, 0, 0],
+        [cx + radius, cy - radius * aspect, 1, 1],
+        [cx + radius, cy + radius * aspect, 1, 0],
+      ],
+      tint
+    );
+  }
+
+  /**
+   * Approximate a round circle in clip space with a stack of thin boxes.
+   * A clip-space square is stretched on a wide screen, so the vertical radius
+   * is the horizontal one times the aspect ratio to end up round on display.
+   */
+  function discClip(cx, cy, radius, color, alpha = 1) {
+    if (radius <= 0.01) return;
+    const aspect = canvas.width / canvas.height;
+    const halfY = radius * aspect;
+    const rows = 24;
+    const rowH = (2 * halfY) / rows;
+
+    for (let i = 0; i < rows; i++) {
+      const dy = -halfY + (i + 0.5) * rowH;
+      const t = dy / halfY;
+      const half = radius * Math.sqrt(Math.max(0, 1 - t * t));
+      rectClip(cx - half, cy + dy - rowH / 2, half * 2, rowH, color, alpha);
+    }
   }
 
   /** Draw the sky as one full-screen vertical gradient. */
   function background(topColor, bottomColor) {
-    push(-1, -1, 1, 1, bottomColor, topColor);
+    push(-1, -1, 1, 1, bottomColor, topColor, 1);
   }
 
   /**
@@ -654,7 +1289,8 @@ function createRenderer(canvas) {
     }
   }
 
-  /** Draw a textured platform: grass blades on top, brick or plank body. */
+  /** Draw one platform: a photo body when the texture is loaded, otherwise a
+   * procedural brick or plank pattern. */
   function drawPlatform(plat, cam, view) {
     if (plat.kind === "wall") {
       rect(plat.x, plat.y, plat.w, plat.h, [0.33, 0.36, 0.43], cam, view);
@@ -667,23 +1303,44 @@ function createRenderer(canvas) {
     const body = plat.kind === "ground" ? [0.31, 0.4, 0.32] : [0.55, 0.49, 0.42];
     const top = plat.kind === "ground" ? [0.41, 0.76, 0.44] : [0.86, 0.78, 0.58];
 
-    rect(plat.x, plat.y, plat.w, plat.h, body, cam, view, top);
+    // The real photo (brick for ground, wood for floating platforms) is drawn
+    // as one textured quad and flushed immediately, so the flat details that
+    // follow always end up on top of it.
+    const photo = rectTex(
+      plat.x,
+      plat.y,
+      plat.w,
+      plat.h,
+      body,
+      cam,
+      view,
+      plat.kind === "ground" ? "brick" : "wood",
+      plat.kind === "ground" ? 3 : 2
+    );
+    flushTex();
 
-    // Brick texture: mortar lines plus a few bricks in a slightly different shade.
-    const mortar = mix(body, [0, 0, 0], 0.22);
-    const columns = Math.floor(plat.w);
-    const rows = Math.floor(plat.h);
+    if (photo) {
+      // One thin mortar line keeps the brick photo connected to the game's own
+      // look without hiding the photograph.
+      rect(plat.x, plat.y + plat.h - 0.5, plat.w, 0.1, mix(body, [0, 0, 0], 0.2), cam, view);
+    } else {
+      // Procedural brick texture: mortar lines plus a few bricks in a slightly
+      // different shade.
+      const mortar = mix(body, [0, 0, 0], 0.22);
+      const columns = Math.floor(plat.w);
+      const rows = Math.floor(plat.h);
 
-    for (let cy = 0; cy < rows; cy++) {
-      rect(plat.x, plat.y + cy + 0.9, plat.w, 0.1, mortar, cam, view);
-      const offset = cy % 2 === 0 ? 0 : 0.5;
-      for (let cx = 0; cx <= columns; cx++) {
-        const bx = plat.x + cx + offset;
-        if (bx < plat.x + plat.w - 0.05) rect(bx, plat.y + cy, 0.1, 0.9, mortar, cam, view);
-      }
-      for (let cx = 0; cx < columns; cx++) {
-        if (hash(Math.round(plat.x * 10) + cx, Math.round(plat.y * 10) + cy) < 0.28) {
-          rect(plat.x + cx + offset + 0.1, plat.y + cy + 0.12, 0.8, 0.72, mix(body, [1, 1, 1], 0.07), cam, view);
+      for (let cy = 0; cy < rows; cy++) {
+        rect(plat.x, plat.y + cy + 0.9, plat.w, 0.1, mortar, cam, view);
+        const offset = cy % 2 === 0 ? 0 : 0.5;
+        for (let cx = 0; cx <= columns; cx++) {
+          const bx = plat.x + cx + offset;
+          if (bx < plat.x + plat.w - 0.05) rect(bx, plat.y + cy, 0.1, 0.9, mortar, cam, view);
+        }
+        for (let cx = 0; cx < columns; cx++) {
+          if (hash(Math.round(plat.x * 10) + cx, Math.round(plat.y * 10) + cy) < 0.28) {
+            rect(plat.x + cx + offset + 0.1, plat.y + cy + 0.12, 0.8, 0.72, mix(body, [1, 1, 1], 0.07), cam, view);
+          }
         }
       }
     }
@@ -727,34 +1384,135 @@ function createRenderer(canvas) {
     }
   }
 
+  /** Approximate a filled disc with a stack of thin rectangles. */
+  function disc(cx, cy, r, color, cam, view) {
+    if (r <= 0.05) return;
+    const rows = 9;
+    const rowH = (2 * r) / rows;
+
+    for (let i = 0; i < rows; i++) {
+      const dy = -r + (i + 0.5) * rowH;
+      const half = r * Math.sqrt(Math.max(0, 1 - (dy / r) * (dy / r)));
+      rect(cx - half, cy + dy - rowH / 2, half * 2, rowH, color, cam, view);
+    }
+  }
+
+  /** Draw a jet fighter crossing the sky, nose pointed in its travel direction. */
+  function drawJet(jet, cam, view, time) {
+    const body = [0.8, 0.84, 0.9];
+    const dark = [0.44, 0.49, 0.57];
+    const front = jet.dir > 0 ? jet.x + jet.w : jet.x;
+    const back = jet.dir > 0 ? jet.x : jet.x + jet.w;
+
+    // Exhaust trail behind the aircraft.
+    const trail = 3 + 2 * Math.abs(Math.sin(time * 3 + jet.id));
+    rect(jet.dir > 0 ? back - trail : back, jet.y + jet.h * 0.35, trail, 0.22, [0.55, 0.62, 0.7], cam, view);
+
+    // Fuselage, nose cone, wing and tail fin.
+    rect(jet.x, jet.y, jet.w, jet.h, body, cam, view, mix(body, [1, 1, 1], 0.12));
+    rect(jet.dir > 0 ? front : front - 0.8, jet.y + jet.h * 0.3, 0.8, jet.h * 0.4, body, cam, view);
+    rect(jet.x + jet.w * 0.2, jet.y - 0.55, jet.w * 0.55, 0.55, dark, cam, view);
+    rect(jet.dir > 0 ? back : back - 0.5, jet.y + jet.h, 0.5, 0.75, dark, cam, view);
+    rect(jet.x + jet.w * 0.6, jet.y + jet.h * 0.5, jet.w * 0.22, 0.32, [0.2, 0.26, 0.34], cam, view);
+
+    // Flickering engine flame at the rear.
+    const flame = 0.5 + 0.4 * Math.abs(Math.sin(time * 12 + jet.id));
+    rect(jet.dir > 0 ? back - flame : back, jet.y + jet.h * 0.3, flame, jet.h * 0.4, [0.95, 0.62, 0.3], cam, view);
+  }
+
+  /** Draw a falling bomb, its dashed drop line and the blinking ground marker. */
+  function drawBomb(bomb, cam, view, time) {
+    // Every other frame the warning flashes, so the player sees it clearly.
+    const blink = Math.floor(time * 8) % 2 === 0;
+
+    if (bomb.targetY !== null) {
+      // Dashed line showing exactly where the bomb will land.
+      const lineColor = blink ? [0.95, 0.45, 0.35] : [0.6, 0.3, 0.28];
+      for (let y = bomb.targetY; y < bomb.y; y += 0.8) {
+        rect(bomb.x - 0.07, y, 0.14, 0.4, lineColor, cam, view);
+      }
+
+      // Danger marker on the ground: a wide bar with a bright core above it.
+      rect(bomb.x - 1.1, bomb.targetY, 2.2, 0.22, blink ? [0.92, 0.36, 0.3] : [0.66, 0.26, 0.24], cam, view);
+      rect(bomb.x - 0.4, bomb.targetY + 0.22, 0.8, 0.3, blink ? [1, 0.55, 0.4] : [0.8, 0.4, 0.35], cam, view);
+    }
+
+    // The bomb itself: dark body, fins, blinking fuse light.
+    rect(bomb.x - bomb.w / 2, bomb.y, bomb.w, bomb.h, [0.32, 0.34, 0.39], cam, view, [0.5, 0.52, 0.58]);
+    rect(bomb.x - 0.28, bomb.y + bomb.h, 0.56, 0.28, [0.45, 0.47, 0.52], cam, view);
+    rect(bomb.x - 0.1, bomb.y + bomb.h + 0.28, 0.2, 0.28, blink ? [1, 0.7, 0.3] : [0.5, 0.35, 0.2], cam, view);
+  }
+
+  /** Draw an explosion: a growing fireball with a bright core and dark smoke. */
+  function drawBlast(blast, cam, view, time) {
+    const age = Math.min(1, (time - blast.start) / (blast.duration || BLAST_DURATION));
+    const r = blast.radius * (0.4 + 0.6 * age);
+    const center = blast.y + r * 0.6;
+
+    // Scorch mark on the solid ground the bomb hit.
+    rect(blast.x - r, blast.y, r * 2, 0.18, [0.2, 0.22, 0.26], cam, view);
+
+    disc(blast.x, center, r, [0.35, 0.33, 0.32], cam, view); // smoke
+    disc(blast.x, center, r * 0.72, [0.92, 0.45, 0.22], cam, view); // flame
+    disc(blast.x, center, r * 0.4, [1, 0.9, 0.55], cam, view); // hot core
+
+    // Fragments flung sideways; hash keeps them scattered but stable.
+    for (let i = 0; i < 6; i++) {
+      const spread = r * (0.6 + hash(Math.round(blast.x * 10), i) * 0.8);
+      rect(blast.x + spread, center + age * 1.2, 0.25, 0.25, [0.35, 0.33, 0.32], cam, view);
+      rect(blast.x - spread, center + age * 1.5, 0.25, 0.25, [0.35, 0.33, 0.32], cam, view);
+    }
+  }
+
+  /** Draw the moon: a soft halo and the photo disc on its arc across the sky. */
+  function drawMoon(time) {
+    const moon = moonPosition(time);
+    const tint = moonTint(moon.altitude);
+
+    // The halo is a big half-transparent disc, so the moon lights the sky.
+    discClip(moon.x, moon.y, MOON_RADIUS * 1.9, mix(tint, [1, 1, 1], 0.3), 0.16 + 0.1 * moon.altitude);
+
+    if (textures.has("moon")) {
+      discTex(moon.x, moon.y, MOON_RADIUS, tint, "moon");
+    } else {
+      discClip(moon.x, moon.y, MOON_RADIUS, tint);
+    }
+  }
+
   /** Render one frame of the scene. */
   function draw(scene) {
     quads = 0;
     count = 0;
-    const { cam, view, world, player, enemies, time } = scene;
+    texQuads = 0;
+    texCount = 0;
+    texName = null;
+    drawnQuads = 0;
+    const { cam, view, world, player, enemies, threats, time, moonTime } = scene;
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
 
     background([0.09, 0.14, 0.26], [0.6, 0.76, 0.84]);
 
-    // Fixed sky layer: stars and a moon.
+    // Fixed sky layer: the stars never move with the camera.
     for (let i = 0; i < 42; i++) {
       const sx = -1 + (i * 0.049) % 2;
       const sy = 0.06 + ((i * 0.137) % 0.85);
       rectClip(sx, sy, 0.006, 0.006, [0.85, 0.9, 0.95]);
     }
-    // Moon: rows of different widths make the square read as a round disc.
-    const moonX = -0.795;
-    const rows = [0.07, 0.11, 0.13, 0.11, 0.07];
-    for (let i = 0; i < rows.length; i++) {
-      rectClip(moonX - rows[i] / 2, 0.5 + i * 0.026, rows[i], 0.026, [0.93, 0.95, 0.84]);
-    }
+
+    // The moon is drawn before the city, so the skyline can hide it while it
+    // rises and sets.
+    drawMoon(moonTime === undefined ? time : moonTime);
+    flushFlat();
+    flushTex();
 
     // Slow drifting clouds: thin haze strips with a lighter core.
     for (let i = 0; i < 6; i++) {
       const cx = ((i * 0.42 + time * 0.012) % 2.4) - 1.2;
       const cy = 0.16 + ((i * 0.31) % 0.62);
-      rectClip(cx, cy, 0.42, 0.035, [0.4, 0.5, 0.6]);
-      rectClip(cx + 0.08, cy + 0.035, 0.24, 0.03, [0.45, 0.55, 0.65]);
-      rectClip(cx + 0.05, cy - 0.02, 0.14, 0.02, [0.38, 0.47, 0.57]);
+      rectClip(cx, cy, 0.42, 0.035, [0.4, 0.5, 0.6], 0.55);
+      rectClip(cx + 0.08, cy + 0.035, 0.24, 0.03, [0.45, 0.55, 0.65], 0.55);
+      rectClip(cx + 0.05, cy - 0.02, 0.14, 0.02, [0.38, 0.47, 0.57], 0.55);
     }
 
     // Far city skyline and distant hills (slow parallax).
@@ -772,6 +1530,9 @@ function createRenderer(canvas) {
     for (const b of world.buildings) {
       if (b.layer === 1) drawBuilding(b, midCam, view, true, time);
     }
+
+    // The skyline sits behind the level, so it must reach the GPU first.
+    flushFlat();
 
     // Platforms with texture.
     for (const plat of world.platforms) drawPlatform(plat, cam, view);
@@ -815,25 +1576,27 @@ function createRenderer(canvas) {
       rect(p.x + p.w, p.y + p.h * 0.4, 0.2, 0.45, [0.85, 0.4, 0.3], cam, view);
     }
 
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, count), gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(posLoc);
-    gl.enableVertexAttribArray(colorLoc);
-    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 0);
-    gl.vertexAttribPointer(colorLoc, 3, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 2 * 4);
-    gl.drawArrays(gl.TRIANGLES, 0, quads * 6);
-    return quads;
+    // Jets, falling bombs and explosions are drawn last so they sit on top of
+    // the level and stay readable against the sky.
+    if (threats) {
+      for (const jet of threats.jets) drawJet(jet, cam, view, time);
+      for (const bomb of threats.bombs) drawBomb(bomb, cam, view, time);
+      for (const blast of threats.blasts) drawBlast(blast, cam, view, time);
+    }
+
+    flushFlat();
+    return drawnQuads;
   }
 
-  return { resize, draw, gl };
+  return { resize, draw, setTextures, gl };
 }
 
-/** Compile and link the vertex + fragment shaders into one program. */
-function buildProgram(gl) {
+/** Compile and link one vertex + fragment shader pair into a program. */
+function buildProgram(gl, vertexSource, fragmentSource) {
   const program = gl.createProgram();
   const sources = [
-    [VERTEX_SOURCE, gl.VERTEX_SHADER],
-    [FRAGMENT_SOURCE, gl.FRAGMENT_SHADER],
+    [vertexSource, gl.VERTEX_SHADER],
+    [fragmentSource, gl.FRAGMENT_SHADER],
   ];
 
   for (const [source, type] of sources) {
@@ -863,6 +1626,9 @@ function buildProgram(gl) {
 
 
 
+
+
+
 const canvas = document.getElementById("game");
 const hud = {
   score: document.getElementById("score"),
@@ -870,7 +1636,10 @@ const hud = {
   seed: document.getElementById("seed"),
   enemies: document.getElementById("enemies"),
   distance: document.getElementById("distance"),
+  bombs: document.getElementById("bombs"),
   status: document.getElementById("status"),
+  alert: document.getElementById("alert"),
+  credits: document.getElementById("credits"),
   overlay: document.getElementById("overlay"),
 };
 
@@ -882,24 +1651,30 @@ let world;
 let player;
 let camera;
 let view;
+let threats;
 let lives = 3;
 let score = 0;
 let stomps = 0;
+let bombs = 0;
 let farthest = 0;
 let time = 0;
 let accumulator = 0;
 let lastFrame = 0;
 let lastQuads = 0;
 let gameOver = false;
+let textureInfo = []; // name and source of every texture the renderer has
+let moonOffset = 0; // lets the checks start the moon arc at a chosen moment
 
 /** Start (or restart) a run with a given seed. */
 function newGame(seed) {
   world = createWorld(seed);
   player = createPlayer(world.spawn.x, world.spawn.y);
   camera = createCamera(world.spawn.x + 6, world.spawn.y + 5);
+  threats = createThreats(seed);
   lives = 3;
   score = 0;
   stomps = 0;
+  bombs = 0;
   farthest = 0;
   gameOver = false;
   hud.overlay.classList.add("hidden");
@@ -956,6 +1731,13 @@ function update(dt) {
     respawn();
   }
 
+  // Jets cross the sky and drop bombs; the blast kills enemies and can hit the
+  // player, which costs a life just like touching an enemy.
+  const events = stepThreats(threats, world, player, dt, time);
+  if (events.bombDropped) bombs += 1;
+  if (events.enemiesKilled) score += events.enemiesKilled * 50;
+  if (events.playerHit) respawn();
+
   if (player.y < deathY(world)) respawn();
 
   farthest = Math.max(farthest, Math.floor(player.x));
@@ -971,6 +1753,9 @@ function updateHud() {
   hud.seed.textContent = String(world.seed);
   hud.enemies.textContent = String(stomps);
   hud.distance.textContent = String(farthest);
+  hud.bombs.textContent = String(bombs);
+  // Warn the player while a bomb is in the air.
+  hud.alert.textContent = threats && threats.bombs.length > 0 ? "Bomb incoming!" : "";
 }
 
 /** Fit the canvas and the view rectangle to the window size. */
@@ -980,6 +1765,21 @@ function resize() {
   view = computeView(canvas.width / canvas.height);
   canvas.style.width = window.innerWidth + "px";
   canvas.style.height = window.innerHeight + "px";
+}
+
+/** Draw the current scene with WebGL and return the number of quads sent. */
+function renderFrame() {
+  lastQuads = renderer.draw({
+    cam: camera,
+    view,
+    world,
+    player,
+    enemies: world.enemies,
+    threats,
+    time,
+    moonTime: time + moonOffset,
+  });
+  return lastQuads;
 }
 
 /** Main animation loop. */
@@ -995,7 +1795,7 @@ function loop(now) {
     }
   }
 
-  lastQuads = renderer.draw({ cam: camera, view, world, player, enemies: world.enemies, time });
+  renderFrame();
   requestAnimationFrame(loop);
 }
 
@@ -1015,12 +1815,25 @@ window.addEventListener("keydown", (event) => {
 window.addEventListener("keyup", (event) => keys.delete(event.key.toLowerCase()));
 window.addEventListener("resize", resize);
 
+/** Download the photo textures and hand them to the renderer. */
+function loadTextureSet() {
+  loadTextures().then((textures) => {
+    renderer.setTextures(textures);
+    textureInfo = textures.map((t) => ({ name: t.name, source: t.source, credit: t.credit }));
+
+    const real = textures.filter((t) => t.ok).length;
+    hud.status.textContent = "WebGL ready - " + real + " of " + textures.length + " photo textures";
+    hud.credits.textContent = textures.map((t) => t.credit).join(" · ");
+  });
+}
+
 try {
   renderer = createRenderer(canvas);
   resize();
   const fromUrl = new URLSearchParams(window.location.search).get("seed");
   newGame(fromUrl ? Number(fromUrl) : 1234);
   hud.status.textContent = "WebGL ready";
+  loadTextureSet();
   requestAnimationFrame(loop);
 } catch (error) {
   hud.status.textContent = "Error: " + error.message;
@@ -1046,14 +1859,65 @@ window.__game = {
     player.onGround = false;
     return enemy.x;
   },
+  /** Force a jet to appear on the next physics step (used by the browser checks). */
+  spawnJet: () => {
+    if (!threats) return null;
+    threats.nextJet = time;
+    return threats.nextJet;
+  },
+  /** Where the moon currently is on its arc (clip space, -1..1). */
+  moon: () => moonPosition(time + moonOffset),
+  /** Start the moon arc at a chosen moment of the cycle (used by the checks). */
+  setMoonPhase: (seconds) => {
+    moonOffset = seconds - time;
+    return moonPosition(seconds);
+  },
+  /** Which textures were really downloaded and which use the stand-in. */
+  textures: () => textureInfo,
+  /** One platform of the current world, for the pixel checks. */
+  platform: (index) => (world ? world.platforms[index] : null),
+  /**
+   * Read the pixels of a world rectangle straight from the WebGL canvas.
+   * Used by the browser checks to prove that a texture stays anchored to the
+   * world while the camera moves.
+   */
+  readWorldRect: (x, y, w, h) => {
+    const gl = renderer.gl;
+
+    // Redraw first: after a frame is presented the browser may reuse the
+    // framebuffer, so readPixels only reliably sees the geometry just drawn.
+    renderFrame();
+
+    const x1 = ((x - camera.x) * 2) / view.w;
+    const y1 = ((y - camera.y) * 2) / view.h;
+    const x2 = ((x + w - camera.x) * 2) / view.w;
+    const y2 = ((y + h - camera.y) * 2) / view.h;
+
+    const px = Math.round(((x1 + 1) / 2) * canvas.width);
+    const py = Math.round(((y1 + 1) / 2) * canvas.height);
+    const pw = Math.max(1, Math.round(((x2 - x1) / 2) * canvas.width));
+    const ph = Math.max(1, Math.round(((y2 - y1) / 2) * canvas.height));
+
+    const pixels = new Uint8Array(pw * ph * 4);
+    gl.readPixels(px, py, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    return { px, py, pw, ph, cam: { x: camera.x, y: camera.y }, canvasWidth: canvas.width, canvasHeight: canvas.height, pixels: Array.from(pixels) };
+  },
   state: () => ({
     seed: world ? world.seed : null,
+    time,
+    moon: moonPosition(time + moonOffset),
     platforms: world ? world.platforms.length : 0,
     enemies: world ? world.enemies.length : 0,
     stomps,
     score,
     lives,
     farthest,
+    jets: threats ? threats.jets.length : 0,
+    bombsInAir: threats ? threats.bombs.length : 0,
+    blasts: threats ? threats.blasts.length : 0,
+    bombsDropped: bombs,
+    textures: textureInfo,
     player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
     quads: lastQuads,
     enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],
