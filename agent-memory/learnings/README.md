@@ -12,4 +12,14 @@ Index of all learning files. Format per entry:
 
 - [Renderer helpers cannot read the frame time from draw()](renderer-helper-missing-frame-time.md) — Keywords: WebGL, renderer, closure, scope, frame time, animation (verified, 2026-11-09)
 
+- [gl.readPixels returns only zeros after the frame is presented](readpixels-sees-nothing-after-the-frame-is-presented.md) — Keywords: gl.readPixels, framebuffer, pixel check, renderFrame (verified, 2026-11-10)
+
+- [Photo textures slide when uv uses clip space](textures-slide-when-uv-uses-clip-space.md) — Keywords: texture uv, camera, anchor, world coordinates, jump (verified, 2026-11-10)
+
+- [A plain pixel diff cannot prove a texture stays anchored](pixel-diff-cannot-detect-a-sliding-texture.md) — Keywords: cross-correlation, bestShift, screenshot test, threshold (verified, 2026-11-10)
+
+- [Wikimedia thumbnail URLs return 400](wikimedia-thumbnail-urls-return-400.md) — Keywords: textures, Wikimedia Commons, thumb, 512px, fallback (verified, 2026-11-10)
+
+- [Game time freezes when the run is over](game-time-freezes-on-game-over.md) — Keywords: time, gameOver, moon phase, headless check, setMoonPhase (verified, 2026-11-10)
+
 New files start from `_template.md`. Do not list `_template.md` here.
