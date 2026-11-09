@@ -6,6 +6,9 @@ import { createWorld, ensureWorld, deathY } from "./world.js";
 import { createPlayer, stepPlayer, stepEnemy, playerEnemyCollision } from "./physics.js";
 import { createCamera, computeView, followCamera } from "./camera.js";
 import { createRenderer } from "./renderer.js";
+import { createThreats, stepThreats } from "./jets.js";
+import { loadTextures } from "./textures.js";
+import { moonPosition } from "./moon.js";
 
 const canvas = document.getElementById("game");
 const hud = {
@@ -14,7 +17,10 @@ const hud = {
   seed: document.getElementById("seed"),
   enemies: document.getElementById("enemies"),
   distance: document.getElementById("distance"),
+  bombs: document.getElementById("bombs"),
   status: document.getElementById("status"),
+  alert: document.getElementById("alert"),
+  credits: document.getElementById("credits"),
   overlay: document.getElementById("overlay"),
 };
 
@@ -26,24 +32,30 @@ let world;
 let player;
 let camera;
 let view;
+let threats;
 let lives = 3;
 let score = 0;
 let stomps = 0;
+let bombs = 0;
 let farthest = 0;
 let time = 0;
 let accumulator = 0;
 let lastFrame = 0;
 let lastQuads = 0;
 let gameOver = false;
+let textureInfo = []; // name and source of every texture the renderer has
+let moonOffset = 0; // lets the checks start the moon arc at a chosen moment
 
 /** Start (or restart) a run with a given seed. */
 function newGame(seed) {
   world = createWorld(seed);
   player = createPlayer(world.spawn.x, world.spawn.y);
   camera = createCamera(world.spawn.x + 6, world.spawn.y + 5);
+  threats = createThreats(seed);
   lives = 3;
   score = 0;
   stomps = 0;
+  bombs = 0;
   farthest = 0;
   gameOver = false;
   hud.overlay.classList.add("hidden");
@@ -100,6 +112,13 @@ function update(dt) {
     respawn();
   }
 
+  // Jets cross the sky and drop bombs; the blast kills enemies and can hit the
+  // player, which costs a life just like touching an enemy.
+  const events = stepThreats(threats, world, player, dt, time);
+  if (events.bombDropped) bombs += 1;
+  if (events.enemiesKilled) score += events.enemiesKilled * 50;
+  if (events.playerHit) respawn();
+
   if (player.y < deathY(world)) respawn();
 
   farthest = Math.max(farthest, Math.floor(player.x));
@@ -115,6 +134,9 @@ function updateHud() {
   hud.seed.textContent = String(world.seed);
   hud.enemies.textContent = String(stomps);
   hud.distance.textContent = String(farthest);
+  hud.bombs.textContent = String(bombs);
+  // Warn the player while a bomb is in the air.
+  hud.alert.textContent = threats && threats.bombs.length > 0 ? "Bomb incoming!" : "";
 }
 
 /** Fit the canvas and the view rectangle to the window size. */
@@ -124,6 +146,21 @@ function resize() {
   view = computeView(canvas.width / canvas.height);
   canvas.style.width = window.innerWidth + "px";
   canvas.style.height = window.innerHeight + "px";
+}
+
+/** Draw the current scene with WebGL and return the number of quads sent. */
+function renderFrame() {
+  lastQuads = renderer.draw({
+    cam: camera,
+    view,
+    world,
+    player,
+    enemies: world.enemies,
+    threats,
+    time,
+    moonTime: time + moonOffset,
+  });
+  return lastQuads;
 }
 
 /** Main animation loop. */
@@ -139,7 +176,7 @@ function loop(now) {
     }
   }
 
-  lastQuads = renderer.draw({ cam: camera, view, world, player, enemies: world.enemies, time });
+  renderFrame();
   requestAnimationFrame(loop);
 }
 
@@ -159,12 +196,25 @@ window.addEventListener("keydown", (event) => {
 window.addEventListener("keyup", (event) => keys.delete(event.key.toLowerCase()));
 window.addEventListener("resize", resize);
 
+/** Download the photo textures and hand them to the renderer. */
+function loadTextureSet() {
+  loadTextures().then((textures) => {
+    renderer.setTextures(textures);
+    textureInfo = textures.map((t) => ({ name: t.name, source: t.source, credit: t.credit }));
+
+    const real = textures.filter((t) => t.ok).length;
+    hud.status.textContent = "WebGL ready - " + real + " of " + textures.length + " photo textures";
+    hud.credits.textContent = textures.map((t) => t.credit).join(" · ");
+  });
+}
+
 try {
   renderer = createRenderer(canvas);
   resize();
   const fromUrl = new URLSearchParams(window.location.search).get("seed");
   newGame(fromUrl ? Number(fromUrl) : 1234);
   hud.status.textContent = "WebGL ready";
+  loadTextureSet();
   requestAnimationFrame(loop);
 } catch (error) {
   hud.status.textContent = "Error: " + error.message;
@@ -190,14 +240,65 @@ window.__game = {
     player.onGround = false;
     return enemy.x;
   },
+  /** Force a jet to appear on the next physics step (used by the browser checks). */
+  spawnJet: () => {
+    if (!threats) return null;
+    threats.nextJet = time;
+    return threats.nextJet;
+  },
+  /** Where the moon currently is on its arc (clip space, -1..1). */
+  moon: () => moonPosition(time + moonOffset),
+  /** Start the moon arc at a chosen moment of the cycle (used by the checks). */
+  setMoonPhase: (seconds) => {
+    moonOffset = seconds - time;
+    return moonPosition(seconds);
+  },
+  /** Which textures were really downloaded and which use the stand-in. */
+  textures: () => textureInfo,
+  /** One platform of the current world, for the pixel checks. */
+  platform: (index) => (world ? world.platforms[index] : null),
+  /**
+   * Read the pixels of a world rectangle straight from the WebGL canvas.
+   * Used by the browser checks to prove that a texture stays anchored to the
+   * world while the camera moves.
+   */
+  readWorldRect: (x, y, w, h) => {
+    const gl = renderer.gl;
+
+    // Redraw first: after a frame is presented the browser may reuse the
+    // framebuffer, so readPixels only reliably sees the geometry just drawn.
+    renderFrame();
+
+    const x1 = ((x - camera.x) * 2) / view.w;
+    const y1 = ((y - camera.y) * 2) / view.h;
+    const x2 = ((x + w - camera.x) * 2) / view.w;
+    const y2 = ((y + h - camera.y) * 2) / view.h;
+
+    const px = Math.round(((x1 + 1) / 2) * canvas.width);
+    const py = Math.round(((y1 + 1) / 2) * canvas.height);
+    const pw = Math.max(1, Math.round(((x2 - x1) / 2) * canvas.width));
+    const ph = Math.max(1, Math.round(((y2 - y1) / 2) * canvas.height));
+
+    const pixels = new Uint8Array(pw * ph * 4);
+    gl.readPixels(px, py, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+    return { px, py, pw, ph, cam: { x: camera.x, y: camera.y }, canvasWidth: canvas.width, canvasHeight: canvas.height, pixels: Array.from(pixels) };
+  },
   state: () => ({
     seed: world ? world.seed : null,
+    time,
+    moon: moonPosition(time + moonOffset),
     platforms: world ? world.platforms.length : 0,
     enemies: world ? world.enemies.length : 0,
     stomps,
     score,
     lives,
     farthest,
+    jets: threats ? threats.jets.length : 0,
+    bombsInAir: threats ? threats.bombs.length : 0,
+    blasts: threats ? threats.blasts.length : 0,
+    bombsDropped: bombs,
+    textures: textureInfo,
     player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
     quads: lastQuads,
     enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],

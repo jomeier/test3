@@ -49,6 +49,11 @@
         color: var(--accent);
       }
 
+      .alert {
+        color: #ff7a5c;
+        font-weight: 600;
+      }
+
       #help {
         position: fixed;
         right: 12px;
@@ -82,6 +87,15 @@
       #overlay.hidden {
         display: none;
       }
+
+      #credits {
+        position: fixed;
+        left: 12px;
+        bottom: 10px;
+        color: rgba(232, 241, 245, 0.55);
+        font-size: 11px;
+        max-width: 640px;
+      }
     </style>
   </head>
   <body>
@@ -92,6 +106,8 @@
       <span>Lives <b id="lives">3</b></span>
       <span>Stomped enemies <b id="enemies">0</b></span>
       <span>Distance <b id="distance">0</b></span>
+      <span>Bombs <b id="bombs">0</b></span>
+      <span id="alert" class="alert"></span>
       <span>Seed <b id="seed">1234</b></span>
       <span id="status">starting…</span>
     </div>
@@ -99,9 +115,13 @@
     <div id="help">
       <kbd>A</kbd> / <kbd>D</kbd> run &nbsp; <kbd>Space</kbd> or <kbd>W</kbd> jump &nbsp;
       <kbd>S</kbd> fast-fall &nbsp; <kbd>R</kbd> new world
+      <br />
+      Jets drop bombs: leave the flashing marker before it hits.
     </div>
 
     <div id="overlay" class="hidden"></div>
+
+    <div id="credits" aria-label="Texture credits"></div>
 
     <script type="module" src="src/main.js"></script>
   </body>
