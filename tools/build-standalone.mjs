@@ -4,7 +4,7 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 
-const MODULES = ["prng.js", "world.js", "physics.js", "camera.js", "renderer.js", "main.js"];
+const MODULES = ["prng.js", "world.js", "physics.js", "camera.js", "jets.js", "moon.js", "textures.js", "renderer.js", "main.js"];
 
 /** Remove ES module syntax so the code can run as one plain script. */
 function stripModuleSyntax(source) {
