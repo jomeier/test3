@@ -63,6 +63,25 @@ test("enemies patrol inside the bounds of their platform", () => {
   }
 });
 
+test("the city skyline is generated in two parallax layers", () => {
+  const world = createWorld(17);
+  const far = world.buildings.filter((b) => b.layer === 0);
+  const near = world.buildings.filter((b) => b.layer === 1);
+  assert.ok(far.length > 3 && near.length > 1, "both city layers must be generated");
+  for (const b of world.buildings) {
+    assert.ok(b.w > 0 && b.h > 0, "building with zero size");
+    assert.ok(Number.isInteger(b.id), "building needs an id for its window pattern");
+  }
+});
+
+test("the skyline and the scenery are deterministic for a seed", () => {
+  const a = createWorld(55);
+  const b = createWorld(55);
+  assert.deepStrictEqual(a.buildings, b.buildings);
+  assert.deepStrictEqual(a.decor, b.decor);
+  assert.ok(a.decor.some((d) => d.type === "bush"), "the world should contain bushes");
+});
+
 test("ensureWorld extends the level on demand", () => {
   const world = createWorld(5);
   const before = world.platforms.length;

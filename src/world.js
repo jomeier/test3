@@ -1,6 +1,6 @@
 // Purpose: Generate the jump-and-run world procedurally in chunks (platforms,
-// patrolling enemies, scenery, background hills) so the level grows endlessly
-// to the right and is reproducible from a seed.
+// patrolling enemies, scenery and a parallax city skyline) so the level grows
+// endlessly to the right and is reproducible from a seed.
 
 import { makeRng, range, int, pick, clamp } from "./prng.js";
 
@@ -20,6 +20,7 @@ export function createWorld(seed) {
     enemies: [],
     decor: [],
     hills: [],
+    buildings: [],
     nextX: 0,
     top: START_TOP,
     lowestTop: START_TOP,
@@ -40,7 +41,7 @@ export function ensureWorld(world, upToX) {
 
 /**
  * Add one platform at the right frontier of the world, plus optional
- * decoration, an enemy and a background hill.
+ * decoration, an enemy, a background hill and city buildings.
  */
 function generateChunk(world) {
   const rng = world.rng;
@@ -62,14 +63,49 @@ function generateChunk(world) {
   world.lowestTop = Math.min(world.lowestTop, top);
   world.nextX = x + w;
 
-  if (rng() < 0.55) addDecor(world, plat);
+  addDecor(world, plat);
+  if (rng() < 0.35) addDecor(world, plat);
+
   if (w >= 4.5 && rng() < 0.5) addEnemy(world, plat);
+
   if (rng() < 0.4) {
     world.hills.push({
       x: x - range(rng, 2, 8),
       y: top - 10,
       w: range(rng, 10, 26),
       h: range(rng, 5, 12),
+    });
+  }
+
+  addCity(world, x, top);
+}
+
+/**
+ * Add city buildings for the parallax background.
+ * Layer 0 is the far, dark skyline; layer 1 is the nearer one with lit windows.
+ */
+function addCity(world, x, top) {
+  const rng = world.rng;
+  const id = world.buildings.length;
+
+  if (rng() < 0.9) {
+    world.buildings.push({
+      layer: 0,
+      id,
+      x: x - range(rng, 2, 14),
+      y: top - 12,
+      w: range(rng, 5, 16),
+      h: range(rng, 6, 20),
+    });
+  }
+  if (rng() < 0.6) {
+    world.buildings.push({
+      layer: 1,
+      id: id + 1,
+      x: x - range(rng, 1, 9),
+      y: top - 8,
+      w: range(rng, 4, 11),
+      h: range(rng, 3, 12),
     });
   }
 }
@@ -84,17 +120,20 @@ function addPlatform(world, x, top, w, h, kind) {
   return plat;
 }
 
-/** Add scenery (bush, rock, flower) sitting on a platform. */
+/** Add scenery (bush, tree, flower, rock or street lamp) sitting on a platform. */
 function addDecor(world, plat) {
   const rng = world.rng;
-  const type = pick(rng, ["bush", "rock", "flower", "tree"]);
+  // Bushes are listed twice so greenery is the most common scenery.
+  const type = pick(rng, ["bush", "bush", "tree", "flower", "rock", "lamp"]);
   const size = pick(rng, [0.6, 0.9, 1.2]);
+  const h = type === "tree" ? size * 2.2 : type === "lamp" ? size * 2.4 : type === "bush" ? size * 1.2 : size;
+
   world.decor.push({
     type,
     x: plat.x + range(rng, 0.3, Math.max(0.3, plat.w - size - 0.3)),
     y: plat.top,
     w: size,
-    h: type === "tree" ? size * 2.2 : size,
+    h,
   });
 }
 
