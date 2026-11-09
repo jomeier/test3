@@ -2,11 +2,14 @@
 
 Decisions with reasons: why, not just what. Change only after review.
 
-- [architecture.md](architecture.md) — raw WebGL 1, one batched draw call per
-  frame, small testable modules, standalone build
-- [visual-style.md](visual-style.md) — flat rectangles, value-based depth,
-  procedural textures, background towers run off the bottom of the screen
-- [background-parallax.md](background-parallax.md) — three layers, camera
-  scaling factors, ground line below the view
-- [world-generation.md](world-generation.md) — seeded chunks, gap and height
-  rules, enemy and scenery placement
+Index of all guideline files. Format per entry:
+
+- [Title](file.md) — Keywords: keyword1, keyword2
+
+- [Architecture](architecture.md) — Keywords: WebGL 1, raw WebGL, shader program, draw call, modules, testing, standalone build
+
+- [Visual style](visual-style.md) — Keywords: flat rectangles, depth, procedural textures, colors, background towers, look
+
+- [Background and parallax](background-parallax.md) — Keywords: parallax, layers, skyline, camera, scaling factor, ground line
+
+- [World generation](world-generation.md) — Keywords: seed, chunks, gaps, heights, enemies, scenery, createWorld

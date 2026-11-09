@@ -5,12 +5,12 @@ Memory folder: `agent-memory/`
 | Folder | Purpose | Who changes it |
 |---|---|---|
 | `rules/` | Hard rules. Always apply. | Only with user confirmation |
-| `design-guidelines/` | Style, UI, and architecture decisions with reasons. | Only with user confirmation |
+| `design-guidelines/` | Style, UI, and architecture decisions with reasons. Index: `design-guidelines/README.md` (with keywords). | Only with user confirmation |
 | `learnings/` | Lessons from solved errors. Index: `learnings/README.md`. | Agent, without asking |
 
 Before every task:
 1. Read `agent-memory/rules/`. These rules always apply and override other guidance.
-2. Before changing code or UI, read `agent-memory/design-guidelines/` and follow them.
+2. Before changing code or UI, read `agent-memory/design-guidelines/README.md`. Match the task to the keywords there, then open and follow the relevant guideline files.
 3. Search `agent-memory/learnings/` for similar tasks, known pitfalls, and documented fixes. Open only the relevant files.
 
 Rules and design guidelines:
