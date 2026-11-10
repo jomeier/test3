@@ -40,7 +40,10 @@ export function showOverlay(hud, text) {
 
 /** Report how many photo textures really arrived and who made them. */
 export function reportTextures(hud, textures) {
-  const loaded = textures.filter((texture) => texture.ok).length;
-  hud.status.textContent = "WebGL ready - " + loaded + " of " + textures.length + " photo textures";
+  const photos = textures.filter((texture) => texture.source === "internet");
+  const arrived = photos.filter((texture) => texture.ok).length;
+  const drawn = textures.filter((texture) => texture.source === "procedural").length;
+
+  hud.status.textContent = "WebGL ready - " + arrived + " of " + photos.length + " photos, " + drawn + " drawn in code";
   hud.credits.textContent = textures.map((texture) => texture.credit).join(CREDIT_SEPARATOR);
 }

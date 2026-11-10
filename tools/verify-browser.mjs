@@ -20,7 +20,8 @@ const MIN_PLATFORM_COUNT = 10; // the first world is generated up to x = 120
 const MIN_START_ENEMIES = 1; // and must contain at least one patrolling enemy
 const MIN_ENEMY_MOVE = 0.1; // world units: proof that an enemy really walks
 const MIN_STOMP_SCORE = 100; // points for one stomp, see STOMP_SCORE in main.js
-const PHOTO_TEXTURE_COUNT = 2; // moon, brick and wood are fetched from the web
+const MOON_PHOTO_COUNT = 1; // the moon is the only real photo the game downloads
+const DRAWN_MATERIAL_COUNT = 2; // brick and planks are painted by code
 const MIN_PLATFORM_SHADES = 20; // distinct colours in one sampled platform
 const MAX_TEXTURE_SHIFT = 2; // px: an anchored texture may not slide further
 const MAX_ANCHOR_DIFF = 0.05; // mean pixel difference at that best shift
@@ -456,8 +457,9 @@ async function main() {
       ["the moon rises, pauses at the top and sets", Boolean(moonMoments.rising && moonMoments.top && moonMoments.setting)],
       ["the moon arc runs from the left to the right", moonMoments.rising.x < moonMoments.top.x && moonMoments.top.x < moonMoments.setting.x],
       ["the moon is highest in the middle of the sky", moonMoments.top.y > MOON_HIGH_Y && moonMoments.top.y > moonMoments.rising.y && moonMoments.top.y > moonMoments.setting.y],
-      ["photo textures are downloaded from the internet", textures.length >= PHOTO_TEXTURE_COUNT && textures.filter((t) => t.source === "internet").length >= PHOTO_TEXTURE_COUNT],
-      ["the sampled platform shows photo detail", detail > MIN_PLATFORM_SHADES],
+      ["the moon photo is downloaded from the internet", textures.filter((t) => t.source === "internet" && t.ok).length >= MOON_PHOTO_COUNT],
+      ["the level materials are painted by code", textures.filter((t) => t.source === "procedural" && t.ok).length >= DRAWN_MATERIAL_COUNT],
+      ["the sampled platform shows material detail", detail > MIN_PLATFORM_SHADES],
       ["the platform texture does not slide while jumping", Math.abs(jumpShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(jumpShift.dy) <= MAX_TEXTURE_SHIFT && jumpShift.diff < MAX_ANCHOR_DIFF],
       ["the platform texture does not slide while running", Math.abs(runShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(runShift.dy) <= MAX_TEXTURE_SHIFT && runShift.diff < MAX_ANCHOR_DIFF],
       ["the texture is back in place after landing", Math.abs(landingShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(landingShift.dy) <= MAX_TEXTURE_SHIFT && landingShift.diff < MAX_ANCHOR_DIFF],

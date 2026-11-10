@@ -163,7 +163,7 @@ function loop(now) {
 function loadTextureSet() {
   loadTextures().then((textures) => {
     renderer.setTextures(textures);
-    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit }));
+    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit, ok: texture.ok }));
     reportTextures(hud, textures);
   });
 }

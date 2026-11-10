@@ -1442,18 +1442,24 @@ function drawHill(painter, hill, cam) {
 /* ---- src/drawLevel.js ---- */
 // Purpose: Draw the playable level itself: the ground and floating platforms
 // with their brick or plank surface, the walkable top edge, the grass on top of
-// ground blocks and the scenery props. A platform shows a real photo when
-// textures.js delivered one, otherwise a pattern is computed from its own
-// coordinates, which keeps the world data small and the look reproducible.
+// ground blocks and the scenery props. The material pictures come from
+// textures.js and are tiled on a grid of whole world units, so a joint always
+// lands on a block edge; if a picture is missing, a pattern computed from the
+// block coordinates is drawn instead.
 
 
 
 
-// The starting wall: a stone pillar with a mortar seam in every block row.
-const WALL_BODY_COLOUR = [0.33, 0.36, 0.43];
-const WALL_SEAM_COLOUR = [0.26, 0.29, 0.35];
-const WALL_SEAM_THICKNESS = 0.12;
-const WALL_SEAM_OFFSET = 0.35; // the seam sits inside a row, not on its edge
+// The starting pillar: a stone wall of ashlar blocks with a mortar joint around
+// every block. The blocks are drawn, not textured, so the pillar reads as solid
+// stone and stays different from the brick of the level.
+const WALL_MORTAR_COLOUR = [0.26, 0.29, 0.35];
+const WALL_STONE_COLOURS = [[0.37, 0.4, 0.47], [0.33, 0.36, 0.43], [0.3, 0.33, 0.4]];
+const WALL_STONE_TOP_MIX = 0.08; // of white mixed into the top edge of one block
+const WALL_COURSE_HEIGHT = 1; // one row of stone blocks
+const WALL_BLOCK_WIDTH = 0.75; // one block, the pillar is two blocks wide
+const WALL_JOINT = 0.07; // mortar thickness around a block
+const WALL_STAGGER = [0, 0.5]; // every other row is shifted by half a block
 
 // Bodies and top surfaces of the two platform kinds: ground is thick and green,
 // a floating platform is thin and warm, so the player sees the difference.
@@ -1462,21 +1468,24 @@ const GROUND_TOP_COLOUR = [0.41, 0.76, 0.44];
 const FLOAT_BODY_COLOUR = [0.55, 0.49, 0.42];
 const FLOAT_TOP_COLOUR = [0.86, 0.78, 0.58];
 
-// Photo textures: one brick photo covers three world units; the wood planks are
-// smaller because the planks themselves are smaller.
+// Material pictures from textures.js. One tile covers this many world units, and
+// the module inside the picture divides that number: the brick pattern has a
+// joint every half unit, the planks have a gap every half unit. Because every
+// platform surface sits on a whole world unit, a joint always lands exactly on
+// the edge of a block and the picture never looks cut.
 const BRICK_TEXTURE_NAME = "brick";
 const WOOD_TEXTURE_NAME = "wood";
-const BRICK_TILE = 3; // world units per photo tile
-const WOOD_TILE = 2;
+const BRICK_TILE = 4; // world units per brick tile
+const WOOD_TILE = 2; // world units per plank tile
 
-// One thin mortar line keeps the brick photo connected to the look of the game
-// without hiding the photograph.
-const PHOTO_SEAM_LIFT = 0.5; // measured down from the top of the block
-const PHOTO_SEAM_THICKNESS = 0.1;
-const PHOTO_SEAM_MIX = 0.2; // of black mixed into the body colour
+// Colour the material picture is mixed toward (see PHOTO_TINT_AMOUNT in
+// shaders.js). These are the material colours themselves, so the brick stays a
+// warm red and the planks stay a warm tan instead of taking the block colour.
+const BRICK_TEXTURE_TINT = [0.4, 0.28, 0.24];
+const WOOD_TEXTURE_TINT = [0.45, 0.31, 0.18];
 
-// Fallback brick pattern, used when the photo is missing: mortar lines plus a
-// few bricks in a slightly lighter shade.
+// Fallback brick pattern, used when the material picture is missing: mortar
+// lines plus a few bricks in a slightly lighter shade.
 const BRICK_MORTAR_MIX = 0.22; // of black mixed into the body colour
 const BRICK_MODULE = 1; // one brick row is one world unit tall
 const BRICK_ROW_SEAM_OFFSET = 0.9; // the seam sits near the top of a row
@@ -1491,19 +1500,40 @@ const BRICK_SHADE_WIDTH = 0.8;
 const BRICK_SHADE_HEIGHT = 0.72;
 const BRICK_SHADE_LIGHT_MIX = 0.07; // of white mixed into the body colour
 
-// The lighter strip along the walkable surface that makes a block look lit.
+// Shading that gives a block its depth: a lighter strip along the walkable
+// surface, a thin contact shadow right under it and a darker band at the bottom
+// of the block, so a flat box reads as a solid that is lit from above.
 const TOP_EDGE_HEIGHT = 0.35;
+const CONTACT_SHADOW_HEIGHT = 0.12; // directly under the surface strip
+const CONTACT_SHADOW_MIX = 0.16; // of black mixed into the surface colour
+const BOTTOM_SHADE_HEIGHT = 0.3;
+const BOTTOM_SHADE_MIX = 0.2; // of black mixed into the body colour
 
-// Grass on the walkable surface.
-const GRASS_BLADES_PER_UNIT = 2; // blades per world unit of width
-const GRASS_SIDE_MARGIN = 0.2; // the first blade is set in from the edge
-const GRASS_STEP = 0.5; // distance between two blades
-const GRASS_JITTER = 0.25; // random shift so the blades are not a fence
-const GRASS_MIN_HEIGHT = 0.15;
-const GRASS_GROWTH = 0.4; // extra height taken by the random part
-const GRASS_WIDTH = 0.1;
-const GRASS_BLADE_COLOUR = [0.18, 0.44, 0.28];
-const GRASS_BLADE_MIX = 0.4; // of the blade colour mixed into the surface
+// Grass on the walkable surface: two tone blades of different height, plus the
+// occasional flower, so the surface line is not an even row of sticks.
+const GRASS_BLADES_PER_UNIT = 3; // blades per world unit of width
+const GRASS_SIDE_MARGIN = 0.15; // the first blade is set in from the edge
+const GRASS_JITTER = 0.3; // random shift so the blades are not a fence
+const GRASS_MIN_HEIGHT = 0.16;
+const GRASS_GROWTH = 0.45; // extra height taken by the random part
+const GRASS_TALL_CHANCE = 0.12; // share of blades that grow clearly higher
+const GRASS_TALL_FACTOR = 1.5; // height of those blades
+const GRASS_WIDTH = 0.11;
+const GRASS_TIP_PART = 0.4; // part of the blade that carries the lighter tone
+const GRASS_DARK_COLOUR = [0.16, 0.42, 0.26];
+const GRASS_LIGHT_COLOUR = [0.36, 0.68, 0.4];
+const GRASS_DARK_MIX = 0.55; // of the dark blade colour mixed into the surface
+const GRASS_LIGHT_MIX = 0.35; // of the light blade colour mixed into the surface
+
+// Flowers that stand in the grass now and then. They are separate from the
+// flower prop of the scenery, which stands on its own on a platform.
+const GRASS_FLOWER_CHANCE = 0.06; // share of blade spots that become a flower
+const GRASS_FLOWER_STEM_HEIGHT = 0.3;
+const GRASS_FLOWER_STEM_WIDTH = 0.06;
+const GRASS_FLOWER_HEAD_SIZE = 0.2;
+const GRASS_FLOWER_HEAD_COLOURS = [[0.9, 0.5, 0.58], [0.95, 0.85, 0.42], [0.62, 0.66, 0.92]];
+const GRASS_FLOWER_CORE_SIZE = 0.09;
+const GRASS_FLOWER_CORE_COLOUR = [0.98, 0.93, 0.55];
 
 // One world coordinate scaled by this factor seeds every per-brick and
 // per-blade decision, so the pattern is stable for a platform.
@@ -1542,12 +1572,13 @@ const LAMP_HOUSING_SIDE_OFFSET = 0.5;
 const LAMP_HOUSING_TOP_LIFT = 0.9; // height of the housing above the top
 
 /**
- * Draw one platform: the photo body when the texture arrived, otherwise the
- * procedural pattern, then the top edge and the grass of walkable ground.
+ * Draw one platform: the material picture when it is loaded, otherwise the
+ * procedural pattern, then the depth shading, the walkable surface and the
+ * grass of a ground block.
  */
 function drawPlatform(painter, platform, cam) {
   if (platform.kind === "wall") {
-    drawWall(painter, platform, cam);
+    drawStonePillar(painter, platform, cam);
     return;
   }
 
@@ -1555,44 +1586,65 @@ function drawPlatform(painter, platform, cam) {
   const body = isGround ? GROUND_BODY_COLOUR : FLOAT_BODY_COLOUR;
   const surface = isGround ? GROUND_TOP_COLOUR : FLOAT_TOP_COLOUR;
 
-  // The photo is one textured quad and is flushed right away, so the flat
-  // details that follow always end up on top of it.
-  const photo = painter.rectTex(
+  // The material picture is one textured quad and is flushed right away, so the
+  // flat details that follow always end up on top of it.
+  const picture = painter.rectTex(
     platform.x,
     platform.y,
     platform.w,
     platform.h,
-    body,
+    isGround ? BRICK_TEXTURE_TINT : WOOD_TEXTURE_TINT,
     cam,
     isGround ? BRICK_TEXTURE_NAME : WOOD_TEXTURE_NAME,
     isGround ? BRICK_TILE : WOOD_TILE
   );
   painter.flushTextures();
 
-  if (photo) {
-    painter.rect(
-      platform.x,
-      platform.y + platform.h - PHOTO_SEAM_LIFT,
-      platform.w,
-      PHOTO_SEAM_THICKNESS,
-      mix(body, BLACK, PHOTO_SEAM_MIX),
-      cam
-    );
-  } else {
-    drawBrickPattern(painter, platform, cam, body);
-  }
+  if (!picture) drawBrickPattern(painter, platform, cam, body);
 
-  painter.rect(platform.x, platform.top - TOP_EDGE_HEIGHT, platform.w, TOP_EDGE_HEIGHT, surface, cam);
+  drawBlockShading(painter, platform, cam, body, surface);
 
   if (isGround) drawGrass(painter, platform, cam, surface);
 }
 
-/** Draw the tall stone pillar that stops the player at the left edge. */
-function drawWall(painter, platform, cam) {
-  painter.rect(platform.x, platform.y, platform.w, platform.h, WALL_BODY_COLOUR, cam);
+/**
+ * Light the block: a darker band at its bottom, the lighter strip along the
+ * walkable surface and a thin contact shadow under that strip.
+ */
+function drawBlockShading(painter, platform, cam, body, surface) {
+  painter.rect(platform.x, platform.y, platform.w, BOTTOM_SHADE_HEIGHT, mix(body, BLACK, BOTTOM_SHADE_MIX), cam);
+  painter.rect(platform.x, platform.top - TOP_EDGE_HEIGHT, platform.w, TOP_EDGE_HEIGHT, surface, cam);
+  painter.rect(
+    platform.x,
+    platform.top - TOP_EDGE_HEIGHT - CONTACT_SHADOW_HEIGHT,
+    platform.w,
+    CONTACT_SHADOW_HEIGHT,
+    mix(surface, BLACK, CONTACT_SHADOW_MIX),
+    cam
+  );
+}
 
-  for (let row = 0; row < Math.floor(platform.h); row++) {
-    painter.rect(platform.x, platform.y + row + WALL_SEAM_OFFSET, platform.w, WALL_SEAM_THICKNESS, WALL_SEAM_COLOUR, cam);
+/**
+ * Draw the tall stone pillar that stops the player at the left edge: rows of
+ * ashlar blocks with a mortar joint all around each block, every other row
+ * shifted by half a block.
+ */
+function drawStonePillar(painter, platform, cam) {
+  painter.rect(platform.x, platform.y, platform.w, platform.h, WALL_MORTAR_COLOUR, cam);
+
+  const courses = Math.floor(platform.h / WALL_COURSE_HEIGHT);
+  for (let row = 0; row < courses; row++) {
+    const baseY = platform.y + row * WALL_COURSE_HEIGHT;
+    const shift = WALL_STAGGER[row % WALL_STAGGER.length] * WALL_BLOCK_WIDTH;
+
+    for (let column = -1; column * WALL_BLOCK_WIDTH < platform.w + shift; column++) {
+      const left = Math.max(platform.x, platform.x + column * WALL_BLOCK_WIDTH + shift) + WALL_JOINT;
+      const right = Math.min(platform.x + platform.w, platform.x + (column + 1) * WALL_BLOCK_WIDTH + shift) - WALL_JOINT;
+      if (right <= left) continue;
+
+      const stone = WALL_STONE_COLOURS[Math.floor(hash(row * 3 + 1, column * 5 + 7) * WALL_STONE_COLOURS.length)];
+      painter.rect(left, baseY + WALL_JOINT, right - left, WALL_COURSE_HEIGHT - WALL_JOINT * 2, stone, cam, mix(stone, WHITE, WALL_STONE_TOP_MIX));
+    }
   }
 }
 
@@ -1633,19 +1685,55 @@ function drawBrickPattern(painter, platform, cam, body) {
   }
 }
 
-/** The grass blades standing on the walkable surface of a ground block. */
+/** The grass blades and flowers standing on the walkable surface of a block. */
 function drawGrass(painter, platform, cam, surface) {
   const bladeCount = Math.floor(platform.w * GRASS_BLADES_PER_UNIT);
-  const bladeColour = mix(surface, GRASS_BLADE_COLOUR, GRASS_BLADE_MIX);
+  const step = 1 / GRASS_BLADES_PER_UNIT;
 
   for (let blade = 0; blade < bladeCount; blade++) {
-    const x =
-      platform.x + GRASS_SIDE_MARGIN + blade * GRASS_STEP + hash(blade, Math.round(platform.top * COORD_HASH_SCALE)) * GRASS_JITTER;
+    const spot = hash(blade, Math.round(platform.top * COORD_HASH_SCALE));
+    const x = platform.x + GRASS_SIDE_MARGIN + blade * step + spot * GRASS_JITTER;
     if (x > platform.x + platform.w - GRASS_SIDE_MARGIN) break;
 
-    const height = GRASS_MIN_HEIGHT + hash(blade, Math.round(platform.y * COORD_HASH_SCALE)) * GRASS_GROWTH;
+    const shape = hash(blade + 17, Math.round(platform.y * COORD_HASH_SCALE));
+    if (shape < GRASS_FLOWER_CHANCE) {
+      drawGrassFlower(painter, x, surface, platform.top, cam, hash(blade + 31, Math.round(platform.top * COORD_HASH_SCALE)));
+      continue;
+    }
+
+    const isLight = spot > 0.5;
+    const bladeColour = mixBlade(surface, isLight, GRASS_DARK_MIX, GRASS_LIGHT_MIX);
+    const tipColour = mixBlade(surface, isLight, GRASS_DARK_MIX * 0.6, GRASS_LIGHT_MIX * 0.6);
+    const tall = spot > 1 - GRASS_TALL_CHANCE ? GRASS_TALL_FACTOR : 1;
+    const height = (GRASS_MIN_HEIGHT + shape * GRASS_GROWTH) * tall;
+
     painter.rect(x, platform.top, GRASS_WIDTH, height, bladeColour, cam);
+    // The upper part of the blade is lighter, which is what makes single blades
+    // readable against the surface strip.
+    painter.rect(x, platform.top + height * (1 - GRASS_TIP_PART), GRASS_WIDTH, height * GRASS_TIP_PART, tipColour, cam);
   }
+}
+
+/** One grass blade colour: a light or a dark green mixed into the surface. */
+function mixBlade(surface, isLight, darkMix, lightMix) {
+  return mix(surface, isLight ? GRASS_LIGHT_COLOUR : GRASS_DARK_COLOUR, isLight ? lightMix : darkMix);
+}
+
+/** A small flower in the grass: thin stem, coloured head, bright core. */
+function drawGrassFlower(painter, x, surface, top, cam, colourPick) {
+  const centre = x + GRASS_WIDTH / 2;
+  const head = GRASS_FLOWER_HEAD_COLOURS[Math.floor(colourPick * GRASS_FLOWER_HEAD_COLOURS.length) % GRASS_FLOWER_HEAD_COLOURS.length];
+
+  painter.rect(centre - GRASS_FLOWER_STEM_WIDTH / 2, top, GRASS_FLOWER_STEM_WIDTH, GRASS_FLOWER_STEM_HEIGHT, mix(surface, GRASS_DARK_COLOUR, GRASS_DARK_MIX), cam);
+  painter.rect(centre - GRASS_FLOWER_HEAD_SIZE / 2, top + GRASS_FLOWER_STEM_HEIGHT, GRASS_FLOWER_HEAD_SIZE, GRASS_FLOWER_HEAD_SIZE, head, cam);
+  painter.rect(
+    centre - GRASS_FLOWER_CORE_SIZE / 2,
+    top + GRASS_FLOWER_STEM_HEIGHT + (GRASS_FLOWER_HEAD_SIZE - GRASS_FLOWER_CORE_SIZE) / 2,
+    GRASS_FLOWER_CORE_SIZE,
+    GRASS_FLOWER_CORE_SIZE,
+    GRASS_FLOWER_CORE_COLOUR,
+    cam
+  );
 }
 
 /** Draw scenery: bush, tree, flower, rock or street lamp. */
@@ -2234,83 +2322,245 @@ function createRenderer(canvas) {
 }
 
 /* ---- src/textures.js ---- */
-// Purpose: Load a few real photo textures from the internet (Wikimedia
-// Commons) and turn them into square RGBA pixel buffers WebGL can upload. If a
-// download fails, a small procedural pattern is generated instead so the game
-// still looks good without a network connection.
+// Purpose: Build the texture pixel buffers that the renderer uploads to the GPU.
+// The moon is a real photo from Wikimedia Commons. The two level materials
+// (brick and wooden planks) are painted into a buffer by hand instead, because
+// a photo never tiles cleanly: every module of a hand built pattern divides the
+// texture size and every random value is looked up by the module index, so the
+// pattern continues exactly at the tile border and no seam is ever visible.
+// The level materials also need no network, so the game looks identical offline.
 
 
 
 const TEXTURE_SIZE = 512; // power of two, so WebGL 1 may tile it (REPEAT)
 
-/** The three textures the renderer uses. Kept small on purpose. */
+/**
+ * The three textures of the game. `source` tells the HUD and the browser checks
+ * where the pixels came from: "internet" for a real photo, "procedural" for a
+ * pattern built in this file.
+ */
 const TEXTURES = [
   {
     name: "moon",
     url: "https://upload.wikimedia.org/wikipedia/commons/0/01/Phase-180.jpg",
     credit: "Moon photo: Jay Tanner, CC BY-SA 3.0 (Wikimedia Commons)",
+    source: "internet",
   },
   {
     name: "brick",
-    url: "https://upload.wikimedia.org/wikipedia/commons/a/a4/Surfaces_brick_wall_with_mortar_closeup_view.JPG",
-    credit: "Brick wall: Tomwsulcer, CC0 (Wikimedia Commons)",
+    credit: "Brick pattern: drawn in code",
+    source: "procedural",
   },
   {
     name: "wood",
-    url: "https://upload.wikimedia.org/wikipedia/commons/6/6d/Wood_planks_-_Preview_%28Amal_Kumar_via_Poly_Haven%29.webp",
-    credit: "Wood planks: Amal Kumar via Poly Haven, CC0 (Wikimedia Commons)",
+    credit: "Plank pattern: drawn in code",
+    source: "procedural",
   },
 ];
 
-/** RGB colour of one pixel of the procedural stand-in pattern. */
-function pattern(name, x, y, size) {
-  if (name === "brick") {
-    const rowH = 32;
-    const brickW = 64;
-    const row = Math.floor(y / rowH);
-    const offset = row % 2 === 0 ? 0 : brickW / 2;
-    if (y % rowH < 2 || (x + offset) % brickW < 2) return [135, 135, 128]; // mortar
-    const shade =
-      (0.85 + 0.3 * hash(Math.floor((x + offset) / brickW), row)) * (0.94 + 0.12 * hash(x, y));
-    return [Math.round(140 * shade), Math.round(92 * shade), Math.round(72 * shade)];
-  }
+// How many modules fit into one tile. Every number divides TEXTURE_SIZE, which
+// is what makes the pattern repeat without a seam.
+const BRICK_COURSES = 8; // rows of bricks in one tile
+const BRICKS_PER_COURSE = 4; // bricks per row, running bond offsets every other row
+const PLANKS_PER_TILE = 4; // wooden planks in one tile
 
-  if (name === "wood") {
-    const plank = 64;
-    const row = Math.floor(y / plank);
-    if (y % plank < 2) return [58, 42, 30]; // gap between planks
-    const shade = (0.8 + 0.3 * hash(row, 5)) * (0.9 + 0.2 * hash(Math.floor(x / 3), row * 13));
-    return [Math.round(150 * shade), Math.round(120 * shade), Math.round(88 * shade)];
-  }
+// Feature sizes as a fraction of the texture size, so the same pattern works
+// for a 512 tile and for the small buffers the tests build.
+const MORTAR_FACTOR = 0.008; // brick mortar joint width
+const PLANK_GAP_FACTOR = 0.006; // dark gap between two planks
 
-  // moon: pale grey rock with a handful of darker craters
-  const nx = (x + 0.5) / size;
-  const ny = (y + 0.5) / size;
-  let shade = 0.78 + 0.12 * hash(Math.floor(x / 6), Math.floor(y / 6));
-  for (let i = 0; i < 8; i++) {
-    const cx = hash(i, 3);
-    const cy = hash(i, 7);
-    const r = 0.05 + hash(i, 11) * 0.08;
-    const d = Math.sqrt((nx - cx) * (nx - cx) + (ny - cy) * (ny - cy));
-    if (d < r) shade -= 0.22 * (1 - d / r);
-  }
-  return [Math.round(248 * shade), Math.round(250 * shade), Math.round(238 * shade)];
+// Base colours of the materials, chosen for the finished look: the renderer
+// still mixes them toward the object colour of the platform.
+const MORTAR_COLOUR = [184, 176, 159];
+const BRICK_COLOUR = [155, 88, 64];
+const BRICK_TINT_RANGE = 0.42; // how much the bricks differ from each other
+const BRICK_BLOTCH_RANGE = 0.16; // darker and brighter patches inside one brick
+const PLANK_COLOUR = [173, 132, 86];
+const PLANK_TINT_RANGE = 0.34; // how much the planks differ from each other
+const GRAIN_NOISE = 13; // per pixel brightness noise, in 0..255 steps
+const JOINT_SHADOW = 0.8; // how much darker the face right next to a joint is
+
+/** Smooth (bilinear) interpolation between two values. */
+function mix2(a, b, t) {
+  return a + (b - a) * t;
 }
 
-/** Build a size x size RGBA buffer for one texture without any network access. */
-function fallbackPixels(name, size = TEXTURE_SIZE) {
+/** Smoothstep of a fraction: 0 at the cell edge, 1 at the next one. */
+function ease(t) {
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Value noise over a lattice of cellsX x cellsY cells that wraps at the tile
+ * border. The cell index is taken modulo the lattice, so a blob that is cut by
+ * the border has the same value on both sides and no seam appears. Compared to
+ * one hash per cell this is smooth: no squares, just soft variation.
+ */
+function noiseField(size, cellsX, cellsY, x, y, salt) {
+  const gx = (x / size) * cellsX;
+  const gy = (y / size) * cellsY;
+  const cellX = Math.floor(gx);
+  const cellY = Math.floor(gy);
+  const fx = ease(gx - cellX);
+  const fy = ease(gy - cellY);
+
+  const corner = (column, row) => hash(mod(column, cellsX), mod(row, cellsY) * 13 + salt);
+  return mix2(
+    mix2(corner(cellX, cellY), corner(cellX + 1, cellY), fx),
+    mix2(corner(cellX, cellY + 1), corner(cellX + 1, cellY + 1), fx),
+    fy
+  );
+}
+
+/** Wrap an index into one period so a module that crosses the border stays one module. */
+function mod(value, period) {
+  return ((value % period) + period) % period;
+}
+
+/** Write one rgb colour into an RGBA buffer, clamped to the byte range. */
+function put(pixels, size, x, y, color, alpha = 255) {
+  const i = (y * size + x) * 4;
+  pixels[i] = Math.max(0, Math.min(255, Math.round(color[0])));
+  pixels[i + 1] = Math.max(0, Math.min(255, Math.round(color[1])));
+  pixels[i + 2] = Math.max(0, Math.min(255, Math.round(color[2])));
+  pixels[i + 3] = alpha;
+}
+
+/** Scale a colour by a factor and add a flat offset to every channel. */
+function shade(color, factor, offset = 0) {
+  return [color[0] * factor + offset, color[1] * factor + offset, color[2] * factor + offset];
+}
+
+/**
+ * Brick wall: courses of bricks with a mortar joint, every other row shifted
+ * by half a brick. Each brick gets its own tone, a lighter top edge and a
+ * darker bottom edge, which is what makes a flat wall look like solid stones.
+ */
+function brickPixels(size) {
   const pixels = new Uint8Array(size * size * 4);
+  const courseH = size / BRICK_COURSES;
+  const brickW = size / BRICKS_PER_COURSE;
+  const mortar = Math.max(1, Math.round(size * MORTAR_FACTOR));
+
   for (let y = 0; y < size; y++) {
+    const course = Math.floor(y / courseH);
+    const rowOffset = (course % 2) * (brickW / 2);
+    const faceH = courseH - mortar;
+    // The joint sits at the top of every course, so it lands on a whole world
+    // unit and a block edge always ends on a mortar line.
+    const faceY = mod(y, courseH);
+
     for (let x = 0; x < size; x++) {
-      const i = (y * size + x) * 4;
-      const [r, g, b] = pattern(name, x, y, size);
-      pixels[i] = r;
-      pixels[i + 1] = g;
-      pixels[i + 2] = b;
-      pixels[i + 3] = 255;
+      const position = x + rowOffset;
+      const inBrick = mod(position, brickW);
+      // The brick index is taken modulo the row so a brick that is cut by the
+      // tile border keeps the same tone on both halves: one brick, one colour.
+      const brick = mod(Math.floor(position / brickW), BRICKS_PER_COURSE);
+      const noise = hash(x, y) - 0.5;
+
+      if (faceY < mortar || inBrick < mortar) {
+        // Mortar: a light band that gets slightly brighter in the middle of the
+        // joint, which is what makes the joints look pressed in instead of drawn.
+        const depth = faceY < mortar ? faceY / mortar : inBrick / mortar;
+        put(pixels, size, x, y, shade(MORTAR_COLOUR, 0.9 + 0.1 * depth + noise * 0.07));
+        continue;
+      }
+
+      const tone = 1 - BRICK_TINT_RANGE / 2 + BRICK_TINT_RANGE * hash(brick, course * 7 + 3);
+      const blotch = 1 - BRICK_BLOTCH_RANGE / 2 + BRICK_BLOTCH_RANGE * noiseField(size, 8, 16, x, y, 5);
+      const clay = 1 - 0.06 + 0.12 * noiseField(size, 24, 48, x, y, 11);
+      const bevel = 1.06 - 0.13 * ((faceY - mortar) / faceH); // light on top, shadow below
+      const sideLight = 1.02 - 0.04 * ((inBrick - mortar) / (brickW - mortar));
+      const jointShadow = faceY === mortar || inBrick === mortar ? JOINT_SHADOW : 1;
+      const speck = hash(x * 3 + 1, y * 5 + 2) > 0.985 ? -20 : 0;
+
+      put(pixels, size, x, y, shade(BRICK_COLOUR, tone * blotch * clay * bevel * sideLight * jointShadow, noise * GRAIN_NOISE + speck));
     }
   }
+
   return pixels;
+}
+
+/**
+ * Wooden planks: horizontal boards with a dark gap between them, a light top
+ * edge, long grain streaks that follow the board and a butt joint now and then.
+ * The streaks use sine waves with a whole number of periods across the tile, so
+ * the grain also continues at the border.
+ */
+function woodPixels(size) {
+  const pixels = new Uint8Array(size * size * 4);
+  const plankH = size / PLANKS_PER_TILE;
+  const gap = Math.max(1, Math.round(size * PLANK_GAP_FACTOR));
+  const faceH = plankH - gap;
+
+  for (let y = 0; y < size; y++) {
+    const plank = Math.floor(y / plankH);
+    const faceY = mod(y, plankH); // the gap sits at the top of every plank
+    const joint = Math.round(size * (0.12 + 0.76 * hash(plank, 31)));
+    const tone = 1 - PLANK_TINT_RANGE / 2 + PLANK_TINT_RANGE * hash(plank, 5);
+
+    for (let x = 0; x < size; x++) {
+      if (faceY < gap) {
+        // The gap is a shadow line: darkest at the very top of the tile row.
+        put(pixels, size, x, y, shade(PLANK_COLOUR, 0.34 + 0.05 * hash(x, y)));
+        continue;
+      }
+
+      // The grain runs along the board. The wobble comes from a noise lattice
+      // that wraps at the border, so the grain lines are organic and still
+      // meet exactly at the tile edge. Its amplitude changes along the board so
+      // the waves do not all look the same.
+      const sway = 0.45 + noiseField(size, 2, 1, x, y, 13);
+      const wobble = ((noiseField(size, 3, 1, x, y, 3) - 0.5) * 6 + (noiseField(size, 12, 1, x, y, 7) - 0.5) * 2.5) * sway;
+      const streak = mod(Math.floor(((faceY - gap) / faceH) * 9 + wobble * 3 + 12), 48);
+      const grain = 0.9 + 0.16 * hash(streak, plank * 11 + 3);
+      const fibre = 0.97 + 0.06 * noiseField(size, 64, 32, x, y, 23); // fine wood structure
+      const bevel = 1.08 - 0.15 * ((faceY - gap) / faceH); // bright under the gap, darker below
+      const isJoint = Math.abs(x - joint) <= Math.max(1, gap / 2);
+
+      const factor = tone * grain * fibre * bevel * (isJoint ? 0.6 : 1);
+      put(pixels, size, x, y, shade(PLANK_COLOUR, factor, (hash(x, y) - 0.5) * GRAIN_NOISE));
+    }
+  }
+
+  return pixels;
+}
+
+/**
+ * Moon surface used when the photo cannot be downloaded: pale rock with a few
+ * darker maria and craters. Drawn as one disc, so tiling does not matter here.
+ */
+function moonPixels(size) {
+  const pixels = new Uint8Array(size * size * 4);
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let tone = 0.8 + 0.12 * hash(Math.floor(x / 6), Math.floor(y / 6));
+
+      for (let crater = 0; crater < 9; crater++) {
+        const centreX = hash(crater, 3);
+        const centreY = hash(crater, 7);
+        const radius = 0.05 + hash(crater, 11) * 0.09;
+        const distance = Math.hypot((x + 0.5) / size - centreX, (y + 0.5) / size - centreY);
+        if (distance < radius) tone -= 0.22 * (1 - distance / radius);
+        else if (distance < radius * 1.3) tone += 0.05; // bright rim around a crater
+      }
+
+      put(pixels, size, x, y, shade([246, 248, 236], tone));
+    }
+  }
+
+  return pixels;
+}
+
+/**
+ * Paint one texture into a size x size RGBA buffer. All patterns are periodic:
+ * their modules divide the size, so the GPU can repeat them without a seam.
+ */
+function proceduralPixels(name, size = TEXTURE_SIZE) {
+  if (name === "brick") return brickPixels(size);
+  if (name === "wood") return woodPixels(size);
+  return moonPixels(size);
 }
 
 /**
@@ -2348,23 +2598,27 @@ async function fetchPixels(url, size = TEXTURE_SIZE) {
 }
 
 /**
- * Load every texture. Each entry carries the pixel buffer plus ok/source so the
- * HUD can tell a real photo from the procedural stand-in.
+ * Load every texture. A photo that cannot be downloaded falls back to the
+ * pattern from this file, so the run never ends up with a flat coloured box.
  */
 async function loadTextures() {
   const loaded = [];
 
   for (const texture of TEXTURES) {
+    if (texture.source !== "internet") {
+      loaded.push({ ...texture, ok: true, size: TEXTURE_SIZE, pixels: proceduralPixels(texture.name) });
+      continue;
+    }
+
     try {
-      loaded.push({ ...texture, ok: true, source: "internet", size: TEXTURE_SIZE, pixels: await fetchPixels(texture.url) });
+      loaded.push({ ...texture, ok: true, size: TEXTURE_SIZE, pixels: await fetchPixels(texture.url) });
     } catch (error) {
       loaded.push({
         ...texture,
         ok: false,
-        source: "fallback",
         error: error.message,
         size: TEXTURE_SIZE,
-        pixels: fallbackPixels(texture.name),
+        pixels: proceduralPixels(texture.name),
       });
     }
   }
@@ -2415,8 +2669,11 @@ function showOverlay(hud, text) {
 
 /** Report how many photo textures really arrived and who made them. */
 function reportTextures(hud, textures) {
-  const loaded = textures.filter((texture) => texture.ok).length;
-  hud.status.textContent = "WebGL ready - " + loaded + " of " + textures.length + " photo textures";
+  const photos = textures.filter((texture) => texture.source === "internet");
+  const arrived = photos.filter((texture) => texture.ok).length;
+  const drawn = textures.filter((texture) => texture.source === "procedural").length;
+
+  hud.status.textContent = "WebGL ready - " + arrived + " of " + photos.length + " photos, " + drawn + " drawn in code";
   hud.credits.textContent = textures.map((texture) => texture.credit).join(CREDIT_SEPARATOR);
 }
 
@@ -2775,7 +3032,7 @@ function loop(now) {
 function loadTextureSet() {
   loadTextures().then((textures) => {
     renderer.setTextures(textures);
-    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit }));
+    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit, ok: texture.ok }));
     reportTextures(hud, textures);
   });
 }

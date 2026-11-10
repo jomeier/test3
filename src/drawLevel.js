@@ -1,17 +1,23 @@
 // Purpose: Draw the playable level itself: the ground and floating platforms
 // with their brick or plank surface, the walkable top edge, the grass on top of
-// ground blocks and the scenery props. A platform shows a real photo when
-// textures.js delivered one, otherwise a pattern is computed from its own
-// coordinates, which keeps the world data small and the look reproducible.
+// ground blocks and the scenery props. The material pictures come from
+// textures.js and are tiled on a grid of whole world units, so a joint always
+// lands on a block edge; if a picture is missing, a pattern computed from the
+// block coordinates is drawn instead.
 
 import { hash } from "./prng.js";
 import { mix, WHITE, BLACK } from "./painter.js";
 
-// The starting wall: a stone pillar with a mortar seam in every block row.
-const WALL_BODY_COLOUR = [0.33, 0.36, 0.43];
-const WALL_SEAM_COLOUR = [0.26, 0.29, 0.35];
-const WALL_SEAM_THICKNESS = 0.12;
-const WALL_SEAM_OFFSET = 0.35; // the seam sits inside a row, not on its edge
+// The starting pillar: a stone wall of ashlar blocks with a mortar joint around
+// every block. The blocks are drawn, not textured, so the pillar reads as solid
+// stone and stays different from the brick of the level.
+const WALL_MORTAR_COLOUR = [0.26, 0.29, 0.35];
+const WALL_STONE_COLOURS = [[0.37, 0.4, 0.47], [0.33, 0.36, 0.43], [0.3, 0.33, 0.4]];
+const WALL_STONE_TOP_MIX = 0.08; // of white mixed into the top edge of one block
+const WALL_COURSE_HEIGHT = 1; // one row of stone blocks
+const WALL_BLOCK_WIDTH = 0.75; // one block, the pillar is two blocks wide
+const WALL_JOINT = 0.07; // mortar thickness around a block
+const WALL_STAGGER = [0, 0.5]; // every other row is shifted by half a block
 
 // Bodies and top surfaces of the two platform kinds: ground is thick and green,
 // a floating platform is thin and warm, so the player sees the difference.
@@ -20,21 +26,24 @@ const GROUND_TOP_COLOUR = [0.41, 0.76, 0.44];
 const FLOAT_BODY_COLOUR = [0.55, 0.49, 0.42];
 const FLOAT_TOP_COLOUR = [0.86, 0.78, 0.58];
 
-// Photo textures: one brick photo covers three world units; the wood planks are
-// smaller because the planks themselves are smaller.
+// Material pictures from textures.js. One tile covers this many world units, and
+// the module inside the picture divides that number: the brick pattern has a
+// joint every half unit, the planks have a gap every half unit. Because every
+// platform surface sits on a whole world unit, a joint always lands exactly on
+// the edge of a block and the picture never looks cut.
 const BRICK_TEXTURE_NAME = "brick";
 const WOOD_TEXTURE_NAME = "wood";
-const BRICK_TILE = 3; // world units per photo tile
-const WOOD_TILE = 2;
+const BRICK_TILE = 4; // world units per brick tile
+const WOOD_TILE = 2; // world units per plank tile
 
-// One thin mortar line keeps the brick photo connected to the look of the game
-// without hiding the photograph.
-const PHOTO_SEAM_LIFT = 0.5; // measured down from the top of the block
-const PHOTO_SEAM_THICKNESS = 0.1;
-const PHOTO_SEAM_MIX = 0.2; // of black mixed into the body colour
+// Colour the material picture is mixed toward (see PHOTO_TINT_AMOUNT in
+// shaders.js). These are the material colours themselves, so the brick stays a
+// warm red and the planks stay a warm tan instead of taking the block colour.
+const BRICK_TEXTURE_TINT = [0.4, 0.28, 0.24];
+const WOOD_TEXTURE_TINT = [0.45, 0.31, 0.18];
 
-// Fallback brick pattern, used when the photo is missing: mortar lines plus a
-// few bricks in a slightly lighter shade.
+// Fallback brick pattern, used when the material picture is missing: mortar
+// lines plus a few bricks in a slightly lighter shade.
 const BRICK_MORTAR_MIX = 0.22; // of black mixed into the body colour
 const BRICK_MODULE = 1; // one brick row is one world unit tall
 const BRICK_ROW_SEAM_OFFSET = 0.9; // the seam sits near the top of a row
@@ -49,19 +58,40 @@ const BRICK_SHADE_WIDTH = 0.8;
 const BRICK_SHADE_HEIGHT = 0.72;
 const BRICK_SHADE_LIGHT_MIX = 0.07; // of white mixed into the body colour
 
-// The lighter strip along the walkable surface that makes a block look lit.
+// Shading that gives a block its depth: a lighter strip along the walkable
+// surface, a thin contact shadow right under it and a darker band at the bottom
+// of the block, so a flat box reads as a solid that is lit from above.
 const TOP_EDGE_HEIGHT = 0.35;
+const CONTACT_SHADOW_HEIGHT = 0.12; // directly under the surface strip
+const CONTACT_SHADOW_MIX = 0.16; // of black mixed into the surface colour
+const BOTTOM_SHADE_HEIGHT = 0.3;
+const BOTTOM_SHADE_MIX = 0.2; // of black mixed into the body colour
 
-// Grass on the walkable surface.
-const GRASS_BLADES_PER_UNIT = 2; // blades per world unit of width
-const GRASS_SIDE_MARGIN = 0.2; // the first blade is set in from the edge
-const GRASS_STEP = 0.5; // distance between two blades
-const GRASS_JITTER = 0.25; // random shift so the blades are not a fence
-const GRASS_MIN_HEIGHT = 0.15;
-const GRASS_GROWTH = 0.4; // extra height taken by the random part
-const GRASS_WIDTH = 0.1;
-const GRASS_BLADE_COLOUR = [0.18, 0.44, 0.28];
-const GRASS_BLADE_MIX = 0.4; // of the blade colour mixed into the surface
+// Grass on the walkable surface: two tone blades of different height, plus the
+// occasional flower, so the surface line is not an even row of sticks.
+const GRASS_BLADES_PER_UNIT = 3; // blades per world unit of width
+const GRASS_SIDE_MARGIN = 0.15; // the first blade is set in from the edge
+const GRASS_JITTER = 0.3; // random shift so the blades are not a fence
+const GRASS_MIN_HEIGHT = 0.16;
+const GRASS_GROWTH = 0.45; // extra height taken by the random part
+const GRASS_TALL_CHANCE = 0.12; // share of blades that grow clearly higher
+const GRASS_TALL_FACTOR = 1.5; // height of those blades
+const GRASS_WIDTH = 0.11;
+const GRASS_TIP_PART = 0.4; // part of the blade that carries the lighter tone
+const GRASS_DARK_COLOUR = [0.16, 0.42, 0.26];
+const GRASS_LIGHT_COLOUR = [0.36, 0.68, 0.4];
+const GRASS_DARK_MIX = 0.55; // of the dark blade colour mixed into the surface
+const GRASS_LIGHT_MIX = 0.35; // of the light blade colour mixed into the surface
+
+// Flowers that stand in the grass now and then. They are separate from the
+// flower prop of the scenery, which stands on its own on a platform.
+const GRASS_FLOWER_CHANCE = 0.06; // share of blade spots that become a flower
+const GRASS_FLOWER_STEM_HEIGHT = 0.3;
+const GRASS_FLOWER_STEM_WIDTH = 0.06;
+const GRASS_FLOWER_HEAD_SIZE = 0.2;
+const GRASS_FLOWER_HEAD_COLOURS = [[0.9, 0.5, 0.58], [0.95, 0.85, 0.42], [0.62, 0.66, 0.92]];
+const GRASS_FLOWER_CORE_SIZE = 0.09;
+const GRASS_FLOWER_CORE_COLOUR = [0.98, 0.93, 0.55];
 
 // One world coordinate scaled by this factor seeds every per-brick and
 // per-blade decision, so the pattern is stable for a platform.
@@ -100,12 +130,13 @@ const LAMP_HOUSING_SIDE_OFFSET = 0.5;
 const LAMP_HOUSING_TOP_LIFT = 0.9; // height of the housing above the top
 
 /**
- * Draw one platform: the photo body when the texture arrived, otherwise the
- * procedural pattern, then the top edge and the grass of walkable ground.
+ * Draw one platform: the material picture when it is loaded, otherwise the
+ * procedural pattern, then the depth shading, the walkable surface and the
+ * grass of a ground block.
  */
 export function drawPlatform(painter, platform, cam) {
   if (platform.kind === "wall") {
-    drawWall(painter, platform, cam);
+    drawStonePillar(painter, platform, cam);
     return;
   }
 
@@ -113,44 +144,65 @@ export function drawPlatform(painter, platform, cam) {
   const body = isGround ? GROUND_BODY_COLOUR : FLOAT_BODY_COLOUR;
   const surface = isGround ? GROUND_TOP_COLOUR : FLOAT_TOP_COLOUR;
 
-  // The photo is one textured quad and is flushed right away, so the flat
-  // details that follow always end up on top of it.
-  const photo = painter.rectTex(
+  // The material picture is one textured quad and is flushed right away, so the
+  // flat details that follow always end up on top of it.
+  const picture = painter.rectTex(
     platform.x,
     platform.y,
     platform.w,
     platform.h,
-    body,
+    isGround ? BRICK_TEXTURE_TINT : WOOD_TEXTURE_TINT,
     cam,
     isGround ? BRICK_TEXTURE_NAME : WOOD_TEXTURE_NAME,
     isGround ? BRICK_TILE : WOOD_TILE
   );
   painter.flushTextures();
 
-  if (photo) {
-    painter.rect(
-      platform.x,
-      platform.y + platform.h - PHOTO_SEAM_LIFT,
-      platform.w,
-      PHOTO_SEAM_THICKNESS,
-      mix(body, BLACK, PHOTO_SEAM_MIX),
-      cam
-    );
-  } else {
-    drawBrickPattern(painter, platform, cam, body);
-  }
+  if (!picture) drawBrickPattern(painter, platform, cam, body);
 
-  painter.rect(platform.x, platform.top - TOP_EDGE_HEIGHT, platform.w, TOP_EDGE_HEIGHT, surface, cam);
+  drawBlockShading(painter, platform, cam, body, surface);
 
   if (isGround) drawGrass(painter, platform, cam, surface);
 }
 
-/** Draw the tall stone pillar that stops the player at the left edge. */
-function drawWall(painter, platform, cam) {
-  painter.rect(platform.x, platform.y, platform.w, platform.h, WALL_BODY_COLOUR, cam);
+/**
+ * Light the block: a darker band at its bottom, the lighter strip along the
+ * walkable surface and a thin contact shadow under that strip.
+ */
+function drawBlockShading(painter, platform, cam, body, surface) {
+  painter.rect(platform.x, platform.y, platform.w, BOTTOM_SHADE_HEIGHT, mix(body, BLACK, BOTTOM_SHADE_MIX), cam);
+  painter.rect(platform.x, platform.top - TOP_EDGE_HEIGHT, platform.w, TOP_EDGE_HEIGHT, surface, cam);
+  painter.rect(
+    platform.x,
+    platform.top - TOP_EDGE_HEIGHT - CONTACT_SHADOW_HEIGHT,
+    platform.w,
+    CONTACT_SHADOW_HEIGHT,
+    mix(surface, BLACK, CONTACT_SHADOW_MIX),
+    cam
+  );
+}
 
-  for (let row = 0; row < Math.floor(platform.h); row++) {
-    painter.rect(platform.x, platform.y + row + WALL_SEAM_OFFSET, platform.w, WALL_SEAM_THICKNESS, WALL_SEAM_COLOUR, cam);
+/**
+ * Draw the tall stone pillar that stops the player at the left edge: rows of
+ * ashlar blocks with a mortar joint all around each block, every other row
+ * shifted by half a block.
+ */
+function drawStonePillar(painter, platform, cam) {
+  painter.rect(platform.x, platform.y, platform.w, platform.h, WALL_MORTAR_COLOUR, cam);
+
+  const courses = Math.floor(platform.h / WALL_COURSE_HEIGHT);
+  for (let row = 0; row < courses; row++) {
+    const baseY = platform.y + row * WALL_COURSE_HEIGHT;
+    const shift = WALL_STAGGER[row % WALL_STAGGER.length] * WALL_BLOCK_WIDTH;
+
+    for (let column = -1; column * WALL_BLOCK_WIDTH < platform.w + shift; column++) {
+      const left = Math.max(platform.x, platform.x + column * WALL_BLOCK_WIDTH + shift) + WALL_JOINT;
+      const right = Math.min(platform.x + platform.w, platform.x + (column + 1) * WALL_BLOCK_WIDTH + shift) - WALL_JOINT;
+      if (right <= left) continue;
+
+      const stone = WALL_STONE_COLOURS[Math.floor(hash(row * 3 + 1, column * 5 + 7) * WALL_STONE_COLOURS.length)];
+      painter.rect(left, baseY + WALL_JOINT, right - left, WALL_COURSE_HEIGHT - WALL_JOINT * 2, stone, cam, mix(stone, WHITE, WALL_STONE_TOP_MIX));
+    }
   }
 }
 
@@ -191,19 +243,55 @@ function drawBrickPattern(painter, platform, cam, body) {
   }
 }
 
-/** The grass blades standing on the walkable surface of a ground block. */
+/** The grass blades and flowers standing on the walkable surface of a block. */
 function drawGrass(painter, platform, cam, surface) {
   const bladeCount = Math.floor(platform.w * GRASS_BLADES_PER_UNIT);
-  const bladeColour = mix(surface, GRASS_BLADE_COLOUR, GRASS_BLADE_MIX);
+  const step = 1 / GRASS_BLADES_PER_UNIT;
 
   for (let blade = 0; blade < bladeCount; blade++) {
-    const x =
-      platform.x + GRASS_SIDE_MARGIN + blade * GRASS_STEP + hash(blade, Math.round(platform.top * COORD_HASH_SCALE)) * GRASS_JITTER;
+    const spot = hash(blade, Math.round(platform.top * COORD_HASH_SCALE));
+    const x = platform.x + GRASS_SIDE_MARGIN + blade * step + spot * GRASS_JITTER;
     if (x > platform.x + platform.w - GRASS_SIDE_MARGIN) break;
 
-    const height = GRASS_MIN_HEIGHT + hash(blade, Math.round(platform.y * COORD_HASH_SCALE)) * GRASS_GROWTH;
+    const shape = hash(blade + 17, Math.round(platform.y * COORD_HASH_SCALE));
+    if (shape < GRASS_FLOWER_CHANCE) {
+      drawGrassFlower(painter, x, surface, platform.top, cam, hash(blade + 31, Math.round(platform.top * COORD_HASH_SCALE)));
+      continue;
+    }
+
+    const isLight = spot > 0.5;
+    const bladeColour = mixBlade(surface, isLight, GRASS_DARK_MIX, GRASS_LIGHT_MIX);
+    const tipColour = mixBlade(surface, isLight, GRASS_DARK_MIX * 0.6, GRASS_LIGHT_MIX * 0.6);
+    const tall = spot > 1 - GRASS_TALL_CHANCE ? GRASS_TALL_FACTOR : 1;
+    const height = (GRASS_MIN_HEIGHT + shape * GRASS_GROWTH) * tall;
+
     painter.rect(x, platform.top, GRASS_WIDTH, height, bladeColour, cam);
+    // The upper part of the blade is lighter, which is what makes single blades
+    // readable against the surface strip.
+    painter.rect(x, platform.top + height * (1 - GRASS_TIP_PART), GRASS_WIDTH, height * GRASS_TIP_PART, tipColour, cam);
   }
+}
+
+/** One grass blade colour: a light or a dark green mixed into the surface. */
+function mixBlade(surface, isLight, darkMix, lightMix) {
+  return mix(surface, isLight ? GRASS_LIGHT_COLOUR : GRASS_DARK_COLOUR, isLight ? lightMix : darkMix);
+}
+
+/** A small flower in the grass: thin stem, coloured head, bright core. */
+function drawGrassFlower(painter, x, surface, top, cam, colourPick) {
+  const centre = x + GRASS_WIDTH / 2;
+  const head = GRASS_FLOWER_HEAD_COLOURS[Math.floor(colourPick * GRASS_FLOWER_HEAD_COLOURS.length) % GRASS_FLOWER_HEAD_COLOURS.length];
+
+  painter.rect(centre - GRASS_FLOWER_STEM_WIDTH / 2, top, GRASS_FLOWER_STEM_WIDTH, GRASS_FLOWER_STEM_HEIGHT, mix(surface, GRASS_DARK_COLOUR, GRASS_DARK_MIX), cam);
+  painter.rect(centre - GRASS_FLOWER_HEAD_SIZE / 2, top + GRASS_FLOWER_STEM_HEIGHT, GRASS_FLOWER_HEAD_SIZE, GRASS_FLOWER_HEAD_SIZE, head, cam);
+  painter.rect(
+    centre - GRASS_FLOWER_CORE_SIZE / 2,
+    top + GRASS_FLOWER_STEM_HEIGHT + (GRASS_FLOWER_HEAD_SIZE - GRASS_FLOWER_CORE_SIZE) / 2,
+    GRASS_FLOWER_CORE_SIZE,
+    GRASS_FLOWER_CORE_SIZE,
+    GRASS_FLOWER_CORE_COLOUR,
+    cam
+  );
 }
 
 /** Draw scenery: bush, tree, flower, rock or street lamp. */
