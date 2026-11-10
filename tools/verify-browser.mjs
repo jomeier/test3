@@ -232,6 +232,10 @@ async function main() {
 
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
+    // Chrome keeps a copy of every module it loaded. Without this the checker
+    // can end up testing an old build instead of the file that is on disk.
+    await cdp.send("Network.enable");
+    await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
     await cdp.send("Page.navigate", { url: `http://127.0.0.1:${PORT}/index.html` });
     await sleep(2500);
 
