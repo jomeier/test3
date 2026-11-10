@@ -8,7 +8,7 @@ Index of all guideline files. Format per entry:
 
 - [Architecture](architecture.md) — Keywords: WebGL 1, raw WebGL, shader program, draw call, modules, testing, standalone build
 
-- [Visual style](visual-style.md) — Keywords: flat rectangles, depth, procedural textures, colors, background towers, look
+- [Visual style](visual-style.md) — Keywords: flat rectangles, depth, photo textures, texture uv, colors, background towers, look
 
 - [Background and parallax](background-parallax.md) — Keywords: parallax, layers, skyline, camera, scaling factor, ground line
 

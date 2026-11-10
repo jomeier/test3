@@ -9,9 +9,11 @@ Decisions about how the code is organised, with the reason for each.
   mean fewer things that can break.
 
 - Every visible box is batched into one Float32Array and drawn with a single
-  `gl.drawArrays` call per frame.
-  *Why:* one draw call per frame keeps the game fast even with hundreds of
-  boxes; per-object draw calls would dominate the frame time.
+  `gl.drawArrays` call per program: one flat program and one textured program,
+  so at most two draw calls per frame.
+  *Why:* a textured batch cannot mix two pictures, so it needs its own program,
+  but each program is still flushed exactly once per frame; per-object draw
+  calls would dominate the frame time.
 
 - Game logic lives in small modules (`prng.js`, `world.js`, `physics.js`,
   `camera.js`, `renderer.js`) and the loop only connects them in `main.js`.

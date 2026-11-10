@@ -2,10 +2,15 @@
 
 Decisions about the look of the game, with the reason for each.
 
-- Everything is built from flat axis-aligned rectangles, no sprites, no image
-  files, no shaders beyond a solid colour.
-  *Why:* the renderer needs no asset pipeline and stays readable; the shape of
-  an object is enough to recognise it at a glance.
+- Everything is built from flat axis-aligned rectangles; the only image files
+  are three photos (moon, brick wall, wood planks) fetched from the web and
+  tinted 35 % toward the object colour.
+  *Why:* the renderer still needs no asset pipeline - the photo only adds
+  detail, the shape and the tint still carry the look.
+
+- Photo texture uv comes only from world coordinates, never from the camera.
+  *Why:* uv built from the clip-space box slides the picture over the platform
+  whenever the player jumps.
 
 - Depth is expressed by value, not by blur: distant buildings are lighter and
   hazier (`0.24, 0.31, 0.4`), the near layer is darker (`0.16, 0.21, 0.29`).
