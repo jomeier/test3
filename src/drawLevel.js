@@ -42,6 +42,10 @@ const WOOD_TILE = 2; // world units per plank tile
 const BRICK_TEXTURE_TINT = [0.4, 0.28, 0.24];
 const WOOD_TEXTURE_TINT = [0.45, 0.31, 0.18];
 
+// Repetition breaker: every platform shifts its material tint by up to this
+// share toward white or black, so two neighbouring blocks never look identical.
+const PLATFORM_TINT_MIX = 0.22;
+
 // Fallback brick pattern, used when the material picture is missing: mortar
 // lines plus a few bricks in a slightly lighter shade.
 const BRICK_MORTAR_MIX = 0.22; // of black mixed into the body colour
@@ -145,13 +149,16 @@ export function drawPlatform(painter, platform, cam) {
   const surface = isGround ? GROUND_TOP_COLOUR : FLOAT_TOP_COLOUR;
 
   // The material picture is one textured quad and is flushed right away, so the
-  // flat details that follow always end up on top of it.
+  // flat details that follow always end up on top of it. The tint of each
+  // platform is nudged a little by its own position: the same tile then shows
+  // up twice in a row with a different lightness, which breaks the repeat the
+  // eye would otherwise find.
   const picture = painter.rectTex(
     platform.x,
     platform.y,
     platform.w,
     platform.h,
-    isGround ? BRICK_TEXTURE_TINT : WOOD_TEXTURE_TINT,
+    platformTint(isGround, platform),
     cam,
     isGround ? BRICK_TEXTURE_NAME : WOOD_TEXTURE_NAME,
     isGround ? BRICK_TILE : WOOD_TILE
@@ -163,6 +170,18 @@ export function drawPlatform(painter, platform, cam) {
   drawBlockShading(painter, platform, cam, body, surface);
 
   if (isGround) drawGrass(painter, platform, cam, surface);
+}
+
+/**
+ * Material colour of one platform: the base tint shifted lighter or darker by
+ * the platform position. The shift is picked from whole world units, so it is
+ * stable while the player runs and never changes mid-block.
+ */
+function platformTint(isGround, platform) {
+  const base = isGround ? BRICK_TEXTURE_TINT : WOOD_TEXTURE_TINT;
+  const jitter = hash(Math.round(platform.x * COORD_HASH_SCALE), Math.round(platform.y * COORD_HASH_SCALE)) - 0.5;
+
+  return jitter > 0 ? mix(base, WHITE, jitter * PLATFORM_TINT_MIX) : mix(base, BLACK, -jitter * PLATFORM_TINT_MIX);
 }
 
 /**
