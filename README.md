@@ -55,9 +55,17 @@ The seed can also be fixed with `?seed=1234`.
 node --test tests/*.test.js
 ```
 
-Covers the world generator, the physics (gravity, jumping, collision, stomping),
-the camera maths, the moon arc, the jets, bombs and explosions, and the
-procedural texture stand-ins.
+Covers the world generator, the physics (gravity, jumping, collision,
+stomping), the camera maths, the moon arc, the jets, bombs and explosions, the
+procedural texture stand-ins, the anchored photo textures, the module graph of
+the standalone build and the constant names of every module.
+
+Two extra checks are worth running by hand as well:
+
+```bash
+node tools/build-standalone.mjs        # rebuild standalone.html
+node tools/check-constants.mjs         # every constant name resolves
+```
 
 ## Texture credits
 
@@ -87,17 +95,39 @@ falling bomb and the explosion.
 ## Structure
 
 ```
-index.html          page, HUD and canvas
-src/prng.js         seeded random generator
-src/world.js        procedural platform / enemy / scenery generation
-src/physics.js      player movement, collision, enemy patrol
-src/camera.js       camera follow and world -> clip space conversion
-src/renderer.js     WebGL shaders and quad batching (flat + textured)
-src/jets.js         jet fighters, falling bombs and explosions
-src/moon.js         maths for the moon arc across the sky
-src/textures.js     downloads photo textures, procedural stand-ins
-src/main.js         game loop, input, HUD
-tools/              build and browser verification scripts
-tests/              node test suite
-standalone.html     generated single-file version
+index.html            page, HUD and canvas
+
+src/main.js           game loop: connects the modules, owns the run counters
+src/world.js          procedural platforms, enemies, scenery, skyline data
+src/physics.js        player movement, collision, enemy patrol
+src/camera.js         camera follow, view size, world -> clip space
+src/jets.js           jet fighters, falling bombs and explosions
+src/moon.js           maths for the moon arc across the sky
+src/textures.js       downloads photo textures, procedural stand-ins
+src/prng.js           seeded random generator and coordinate hash
+
+src/renderer.js       WebGL context and the painting order of one frame
+src/shaders.js        the two shader programs (flat colour, photo texture)
+src/batch.js          the two quad batches: one draw call each per frame
+src/painter.js        primitives: boxes, discs, photo boxes, sky gradient
+
+src/drawSky.js        sky gradient, stars, drifting clouds, moon
+src/drawCity.js       parallax skyline with lit windows, background hills
+src/drawLevel.js      platforms (photo or procedural pattern), grass, props
+src/drawActors.js     patrolling enemies and the player
+src/drawThreats.js    jets, falling bombs and explosions
+
+src/hud.js            HUD numbers, bomb warning, overlay, texture credits
+src/input.js          keyboard state -> input object for the physics
+src/debug.js          window.__game hooks used by the browser checks
+
+tools/build-standalone.mjs   bundles src into standalone.html
+tools/check-constants.mjs    finds constant names that resolve nowhere
+tools/verify-browser.mjs     headless Chrome checks and screenshots
+tests/                       node test suite
+standalone.html              generated single-file version
 ```
+
+Every visible box goes into one of two batches, so a frame costs at most two
+`gl.drawArrays` calls. Magic numbers are avoided: colours, sizes, distances and
+animation speeds are named constants in the module that uses them.
