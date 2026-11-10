@@ -232,11 +232,15 @@ const HILL_BASE_DROP = 10; // their base stays below the platform top
 const HILL_WIDTH = [10, 26];
 const HILL_HEIGHT = [5, 12];
 
-// Background city: layer 0 is the far skyline (generated almost every chunk so
-// it reads as one continuous city), layer 1 is the nearer and sparser one.
+// Background city: SKYLINE_FAR_LAYER is the far skyline (generated almost every
+// chunk so it reads as one continuous city), SKYLINE_NEAR_LAYER the nearer and
+// sparser one. The renderer picks its buildings by these numbers.
+const SKYLINE_FAR_LAYER = 0;
+const SKYLINE_NEAR_LAYER = 1;
+
 const CITY_LAYERS = [
-  { layer: 0, chance: 0.9, back: [2, 14], baseDrop: 12, width: [5, 16], height: [6, 20] },
-  { layer: 1, chance: 0.6, back: [1, 9], baseDrop: 8, width: [4, 11], height: [3, 12] },
+  { layer: SKYLINE_FAR_LAYER, chance: 0.9, back: [2, 14], baseDrop: 12, width: [5, 16], height: [6, 20] },
+  { layer: SKYLINE_NEAR_LAYER, chance: 0.6, back: [1, 9], baseDrop: 8, width: [4, 11], height: [3, 12] },
 ];
 
 // Falling out of the level must end the run, but the line has to follow the
@@ -622,6 +626,1173 @@ function belowBottom(cam, view, margin = OFFSCREEN_MARGIN) {
   return cam.y - view.h / 2 - margin;
 }
 
+/* ---- src/shaders.js ---- */
+// Purpose: Hold the shader sources of the two WebGL 1 programs and compile
+// them: one program for flat coloured boxes, one for boxes covered by a real
+// photo. The values that define how a photo is blended are named here.
+
+// 0 keeps the photo as it is, 1 replaces it by the flat game colour. 0.35 lets
+// the photo stay readable while it still matches the palette of the game.
+const PHOTO_TINT_AMOUNT = 0.35;
+
+// A textured quad covers its whole square unless the disc mask is switched on.
+// With the mask: DISC_EDGE is the radius of the circle in uv space, and the
+// edge fades out between DISC_SOFT_EDGE and DISC_EDGE.
+const DISC_EDGE = 0.5;
+const DISC_SOFT_EDGE = 0.42;
+
+// Flat program: colour and alpha per vertex.
+const FLAT_VERTEX_SOURCE = `
+attribute vec2 pos;
+attribute vec3 color;
+attribute float alpha;
+varying vec3 vcolor;
+varying float valpha;
+void main() {
+  vcolor = color;
+  valpha = alpha;
+  gl_Position = vec4(pos, 0.0, 1.0);
+}`;
+
+const FLAT_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec3 vcolor;
+varying float valpha;
+void main() {
+  gl_FragColor = vec4(vcolor, valpha);
+}`;
+
+// Textured program: photo coordinates plus the tint colour of the object.
+const TEXTURED_VERTEX_SOURCE = `
+attribute vec2 pos;
+attribute vec2 uv;
+attribute vec3 color;
+varying vec2 vuv;
+varying vec3 vcolor;
+void main() {
+  vuv = uv;
+  vcolor = color;
+  gl_Position = vec4(pos, 0.0, 1.0);
+}`;
+
+const TEXTURED_FRAGMENT_SOURCE = `
+precision mediump float;
+varying vec2 vuv;
+varying vec3 vcolor;
+uniform sampler2D tex;
+uniform float disc;
+void main() {
+  vec4 photo = texture2D(tex, vuv);
+  vec3 color = mix(photo.rgb, vcolor, ${PHOTO_TINT_AMOUNT});
+  float mask = 1.0;
+  if (disc > 0.5) {
+    float d = distance(vuv, vec2(0.5, 0.5));
+    mask = smoothstep(${DISC_EDGE}, ${DISC_SOFT_EDGE}, d);
+  }
+  gl_FragColor = vec4(color, photo.a * mask);
+}`;
+
+/**
+ * Compile and link one vertex plus fragment pair into a program.
+ * A shader failure throws with the compiler log: a silent failure would only
+ * show up as a black canvas.
+ */
+function buildProgram(gl, vertexSource, fragmentSource) {
+  const program = gl.createProgram();
+  const sources = [
+    [vertexSource, gl.VERTEX_SHADER],
+    [fragmentSource, gl.FRAGMENT_SHADER],
+  ];
+
+  for (const [source, type] of sources) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      throw new Error("Shader compile error: " + gl.getShaderInfoLog(shader));
+    }
+    gl.attachShader(program, shader);
+  }
+
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error("Shader link error: " + gl.getProgramInfoLog(program));
+  }
+  return program;
+}
+
+/* ---- src/batch.js ---- */
+// Purpose: Collect every box of a frame in two big Float32Array buffers and
+// hand each buffer to the GPU with one drawArrays call: a batch for flat
+// coloured quads and a batch for quads covered by a photo texture.
+// At most one draw call per program per frame, which is what keeps the frame
+// time low (see agent-memory/design-guidelines/architecture.md).
+
+
+
+// Batch sizes: a frame never needs more than this many boxes; anything past
+// the limit is dropped instead of growing the buffer.
+const MAX_FLAT_QUADS = 15000;
+const MAX_TEXTURE_QUADS = 4000;
+
+const FLAT_FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
+const TEXTURE_FLOATS_PER_VERTEX = 7; // x, y, u, v, r, g, b
+const VERTICES_PER_BOX = 6; // two triangles
+const FLOAT_BYTES = 4; // one WebGL float
+
+/**
+ * Create the two batches and compile the programs that read them.
+ * Returns the batching API used by the painter primitives.
+ */
+function createBatch(gl) {
+  const flatProgram = buildProgram(gl, FLAT_VERTEX_SOURCE, FLAT_FRAGMENT_SOURCE);
+  const texturedProgram = buildProgram(gl, TEXTURED_VERTEX_SOURCE, TEXTURED_FRAGMENT_SOURCE);
+
+  // Attribute layout of the flat program.
+  const flatPos = gl.getAttribLocation(flatProgram, "pos");
+  const flatColor = gl.getAttribLocation(flatProgram, "color");
+  const flatAlpha = gl.getAttribLocation(flatProgram, "alpha");
+  const flatStride = FLAT_FLOATS_PER_VERTEX * FLOAT_BYTES;
+
+  // Attribute layout of the textured program.
+  const texPos = gl.getAttribLocation(texturedProgram, "pos");
+  const texUv = gl.getAttribLocation(texturedProgram, "uv");
+  const texColor = gl.getAttribLocation(texturedProgram, "color");
+  const texSampler = gl.getUniformLocation(texturedProgram, "tex");
+  const texDisc = gl.getUniformLocation(texturedProgram, "disc");
+  const texStride = TEXTURE_FLOATS_PER_VERTEX * FLOAT_BYTES;
+
+  // Overlapping quads (glow, clouds, the moon) blend instead of hiding each
+  // other, so a translucent box may sit on top of another one.
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  const flatBuffer = gl.createBuffer();
+  const texBuffer = gl.createBuffer();
+  const flatData = new Float32Array(MAX_FLAT_QUADS * VERTICES_PER_BOX * FLAT_FLOATS_PER_VERTEX);
+  const texData = new Float32Array(MAX_TEXTURE_QUADS * VERTICES_PER_BOX * TEXTURE_FLOATS_PER_VERTEX);
+
+  const textures = new Map(); // texture name -> WebGL texture
+  let textureName = null; // photo of the textured batch being collected
+  let discMask = false; // the current textured batch is a round disc
+
+  let flatQuads = 0;
+  let flatCount = 0; // floats written into flatData
+  let texQuads = 0;
+  let texCount = 0; // floats written into texData
+  let drawnQuads = 0; // quads actually sent to the GPU this frame
+
+  /** Append one flat box as two triangles; top and bottom may differ in colour. */
+  function addFlatQuad(x1, y1, x2, y2, bottomColor, topColor, alpha = 1) {
+    const corners = [
+      [x1, y1, bottomColor, alpha],
+      [x2, y1, bottomColor, alpha],
+      [x1, y2, topColor, alpha],
+      [x1, y2, topColor, alpha],
+      [x2, y1, bottomColor, alpha],
+      [x2, y2, topColor, alpha],
+    ];
+
+    for (const [x, y, color, cornerAlpha] of corners) {
+      flatData[flatCount++] = x;
+      flatData[flatCount++] = y;
+      flatData[flatCount++] = color[0];
+      flatData[flatCount++] = color[1];
+      flatData[flatCount++] = color[2];
+      flatData[flatCount++] = cornerAlpha;
+    }
+    flatQuads += 1;
+  }
+
+  /** Append one textured box as two triangles, [x, y, u, v] per vertex. */
+  function addTexturedQuad(verts, tintColor) {
+    for (const [x, y, u, v] of verts) {
+      texData[texCount++] = x;
+      texData[texCount++] = y;
+      texData[texCount++] = u;
+      texData[texCount++] = v;
+      texData[texCount++] = tintColor[0];
+      texData[texCount++] = tintColor[1];
+      texData[texCount++] = tintColor[2];
+    }
+    texQuads += 1;
+  }
+
+  /** Upload and draw the flat quads collected so far. */
+  function flushFlat() {
+    if (flatQuads === 0) return;
+
+    gl.useProgram(flatProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, flatBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, flatData.subarray(0, flatCount), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(flatPos);
+    gl.enableVertexAttribArray(flatColor);
+    gl.enableVertexAttribArray(flatAlpha);
+    gl.vertexAttribPointer(flatPos, 2, gl.FLOAT, false, flatStride, 0);
+    gl.vertexAttribPointer(flatColor, 3, gl.FLOAT, false, flatStride, 2 * FLOAT_BYTES);
+    gl.vertexAttribPointer(flatAlpha, 1, gl.FLOAT, false, flatStride, 5 * FLOAT_BYTES);
+    gl.drawArrays(gl.TRIANGLES, 0, flatQuads * VERTICES_PER_BOX);
+
+    drawnQuads += flatQuads;
+    flatQuads = 0;
+    flatCount = 0;
+  }
+
+  /** Upload and draw the textured quads that share one photo. */
+  function flushTextured() {
+    if (texQuads === 0) return;
+
+    gl.useProgram(texturedProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, texData.subarray(0, texCount), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(texPos);
+    gl.enableVertexAttribArray(texUv);
+    gl.enableVertexAttribArray(texColor);
+    gl.vertexAttribPointer(texPos, 2, gl.FLOAT, false, texStride, 0);
+    gl.vertexAttribPointer(texUv, 2, gl.FLOAT, false, texStride, 2 * FLOAT_BYTES);
+    gl.vertexAttribPointer(texColor, 3, gl.FLOAT, false, texStride, 4 * FLOAT_BYTES);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, textures.get(textureName));
+    gl.uniform1i(texSampler, 0);
+    gl.uniform1f(texDisc, discMask ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, texQuads * VERTICES_PER_BOX);
+
+    drawnQuads += texQuads;
+    texQuads = 0;
+    texCount = 0;
+  }
+
+  /** Forget everything collected so far; called at the start of each frame. */
+  function reset() {
+    flatQuads = 0;
+    flatCount = 0;
+    texQuads = 0;
+    texCount = 0;
+    textureName = null;
+    discMask = false;
+    drawnQuads = 0;
+  }
+
+  /**
+   * Switch the textured batch to another photo.
+   * A batch can only carry one picture, so the old one is drawn first.
+   * Returns false when the picture is not loaded, so the caller can fall back
+   * to a flat colour.
+   */
+  function useTexture(name, asDisc) {
+    if (!textures.has(name)) return false;
+    if (texQuads >= MAX_TEXTURE_QUADS || (textureName !== null && textureName !== name)) flushTextured();
+
+    textureName = name;
+    discMask = asDisc;
+    return true;
+  }
+
+  return {
+    addFlatQuad,
+    addTexturedQuad,
+    flushFlat,
+    flushTextured,
+    useTexture,
+    reset,
+    flatQuads: () => flatQuads,
+    textureQuads: () => texQuads,
+    drawnQuads: () => drawnQuads,
+    hasTexture: (name) => textures.has(name),
+    uploadTextures: (list) => uploadTextures(gl, textures, list),
+    capacity: () => ({ flat: MAX_FLAT_QUADS, textured: MAX_TEXTURE_QUADS }),
+  };
+}
+
+/**
+ * Upload one RGBA pixel buffer as a tiling WebGL texture and remember it by
+ * name. The size is a power of two, which WebGL 1 requires for REPEAT.
+ */
+function uploadTextures(gl, textures, list) {
+  for (const item of list) {
+    if (!item.pixels) continue;
+
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, item.size, item.size, 0, gl.RGBA, gl.UNSIGNED_BYTE, item.pixels);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    textures.set(item.name, texture);
+  }
+
+  return [...textures.keys()];
+}
+
+/* ---- src/painter.js ---- */
+// Purpose: Provide the drawing primitives every scene module uses: boxes in
+// world or clip space, photo-textured boxes, round discs built from thin strips
+// and the full-screen sky gradient. The primitives only fill the two batches of
+// batch.js; they never change game state.
+
+
+
+
+// A disc is approximated by a stack of thin boxes. More rows look rounder but
+// cost more quads, and a tiny disc would waste rows on nothing.
+const CLIP_DISC_ROWS = 24; // discs in clip space (the moon halo)
+const WORLD_DISC_ROWS = 9; // discs in world space (explosion fireball)
+const MIN_CLIP_DISC_RADIUS = 0.01; // smaller clip-space discs are not worth rows
+const MIN_WORLD_DISC_RADIUS = 0.05; // smaller world-space discs are invisible
+
+// Shared mixing colours: every lighter edge is a mix toward WHITE, every seam
+// and shadow is a mix toward BLACK.
+const WHITE = [1, 1, 1];
+const BLACK = [0, 0, 0];
+
+/** Blend two rgb colours: t = 0 keeps the first colour, t = 1 the second. */
+function mix(colorA, colorB, t) {
+  return [colorA[0] + (colorB[0] - colorA[0]) * t, colorA[1] + (colorB[1] - colorA[1]) * t, colorA[2] + (colorB[2] - colorA[2]) * t];
+}
+
+/**
+ * Texture coordinates for a world box. `tile` is the number of world units one
+ * photo covers. The uv values may only depend on the world position, never on
+ * the camera, otherwise the photo slides over the platform whenever the camera
+ * moves (for example when the player jumps). World y grows upwards while row 0
+ * of the image is at the top, so v is negated.
+ */
+function textureUV(x, y, w, h, tile) {
+  return {
+    u1: x / tile,
+    v1: -y / tile,
+    u2: (x + w) / tile,
+    v2: -(y + h) / tile,
+  };
+}
+
+/**
+ * Build the six vertices of one textured box in clip space: [x, y, u, v] per
+ * vertex, two triangles covering the box. The positions follow the camera, the
+ * uv values follow the world only.
+ */
+function texturedQuad(x, y, w, h, cam, view, tile) {
+  const uv = textureUV(x, y, w, h, tile);
+
+  return [
+    [clipX(x, cam, view), clipY(y, cam, view), uv.u1, uv.v1],
+    [clipX(x + w, cam, view), clipY(y, cam, view), uv.u2, uv.v1],
+    [clipX(x, cam, view), clipY(y + h, cam, view), uv.u1, uv.v2],
+    [clipX(x, cam, view), clipY(y + h, cam, view), uv.u1, uv.v2],
+    [clipX(x + w, cam, view), clipY(y, cam, view), uv.u2, uv.v1],
+    [clipX(x + w, cam, view), clipY(y + h, cam, view), uv.u2, uv.v2],
+  ];
+}
+
+/** Horizontal clip space position (-1..1) of a world x. */
+function clipX(x, cam, view) {
+  return ((x - cam.x) * 2) / view.w;
+}
+
+/** Vertical clip space position (-1..1) of a world y. */
+function clipY(y, cam, view) {
+  return ((y - cam.y) * 2) / view.h;
+}
+
+/**
+ * Create the primitives for one canvas.
+ * `batch` collects the quads, `canvas` supplies the aspect ratio that keeps
+ * clip-space discs round on a wide screen.
+ */
+function createPainter(batch, canvas) {
+  let view = null; // size of the view that is currently being drawn
+
+  /** Remember the view of the frame; every primitive reads it from here. */
+  function beginFrame(frameView) {
+    view = frameView;
+  }
+
+  /** How much taller a clip-space unit is than a wide one. */
+  function aspect() {
+    return canvas.width / canvas.height;
+  }
+
+  /** Draw a box given in world coordinates, using `cam` for the view transform. */
+  function rect(x, y, w, h, color, cam, topColor, alpha = 1) {
+    if (batch.flatQuads() >= MAX_FLAT_QUADS) return;
+    if (!inView({ x, y, w, h }, cam, view)) return;
+
+    batch.addFlatQuad(clipX(x, cam, view), clipY(y, cam, view), clipX(x + w, cam, view), clipY(y + h, cam, view), color, topColor || color, alpha);
+  }
+
+  /** Draw a box directly in clip space (-1..1) for the fixed sky layer. */
+  function rectClip(x, y, w, h, color, alpha = 1) {
+    if (batch.flatQuads() >= MAX_FLAT_QUADS) return;
+    batch.addFlatQuad(x, y, x + w, y + h, color, color, alpha);
+  }
+
+  /**
+   * Draw a box with a real photo texture. `tile` is the number of world units
+   * one photo covers. Returns false when the texture is not loaded, so the
+   * caller can fall back to a flat colour.
+   */
+  function rectTex(x, y, w, h, tint, cam, name, tile) {
+    if (batch.flatQuads() >= MAX_FLAT_QUADS) return false;
+    if (!inView({ x, y, w, h }, cam, view)) return false;
+    if (!batch.useTexture(name, false)) return false;
+
+    // The positions move with the camera, the uv values stay in world space,
+    // so the photo never slides when the player jumps.
+    batch.addTexturedQuad(texturedQuad(x, y, w, h, cam, view, tile), tint);
+    return true;
+  }
+
+  /** Draw one photo-textured circle in clip space with a soft edge. */
+  function discTex(cx, cy, radius, tint, name) {
+    if (!batch.useTexture(name, true)) return;
+
+    // A clip-space square is stretched on a wide screen, so the vertical radius
+    // is multiplied by the aspect ratio to keep the disc round on the display.
+    const halfY = radius * aspect();
+    batch.addTexturedQuad(
+      [
+        [cx - radius, cy - halfY, 0, 1],
+        [cx + radius, cy - halfY, 1, 1],
+        [cx - radius, cy + halfY, 0, 0],
+        [cx - radius, cy + halfY, 0, 0],
+        [cx + radius, cy - halfY, 1, 1],
+        [cx + radius, cy + halfY, 1, 0],
+      ],
+      tint
+    );
+  }
+
+  /**
+   * Approximate a round disc in clip space with a stack of thin boxes. The
+   * vertical radius is scaled by the aspect ratio so the disc ends up round.
+   */
+  function discClip(cx, cy, radius, color, alpha = 1) {
+    if (radius <= MIN_CLIP_DISC_RADIUS) return;
+
+    const halfY = radius * aspect();
+    const rowHeight = (2 * halfY) / CLIP_DISC_ROWS;
+
+    for (let row = 0; row < CLIP_DISC_ROWS; row++) {
+      const dy = -halfY + (row + 0.5) * rowHeight;
+      const heightRatio = dy / halfY;
+      const halfWidth = radius * Math.sqrt(Math.max(0, 1 - heightRatio * heightRatio));
+      rectClip(cx - halfWidth, cy + dy - rowHeight / 2, halfWidth * 2, rowHeight, color, alpha);
+    }
+  }
+
+  /** Approximate a round disc in world space with a stack of thin boxes. */
+  function disc(cx, cy, radius, color, cam) {
+    if (radius <= MIN_WORLD_DISC_RADIUS) return;
+
+    const rowHeight = (2 * radius) / WORLD_DISC_ROWS;
+
+    for (let row = 0; row < WORLD_DISC_ROWS; row++) {
+      const dy = -radius + (row + 0.5) * rowHeight;
+      const heightRatio = dy / radius;
+      const halfWidth = radius * Math.sqrt(Math.max(0, 1 - heightRatio * heightRatio));
+      rect(cx - halfWidth, cy + dy - rowHeight / 2, halfWidth * 2, rowHeight, color, cam);
+    }
+  }
+
+  /** Paint the whole screen as one vertical gradient: the sky. */
+  function skyGradient(topColor, bottomColor) {
+    batch.addFlatQuad(-1, -1, 1, 1, bottomColor, topColor, 1);
+  }
+
+  /** World y of the base line a background layer draws down to. */
+  function belowView(cam, margin = OFFSCREEN_MARGIN) {
+    return belowBottom(cam, view, margin);
+  }
+
+  /** Return true when a box is at least partly inside the current view. */
+  function isVisible(box, cam) {
+    return inView(box, cam, view);
+  }
+
+  return {
+    beginFrame,
+    aspect,
+    rect,
+    rectClip,
+    rectTex,
+    disc,
+    discClip,
+    discTex,
+    skyGradient,
+    belowView,
+    isVisible,
+    flushFlat: batch.flushFlat,
+    flushTextures: batch.flushTextured,
+    hasTexture: batch.hasTexture,
+    drawnQuads: batch.drawnQuads,
+    reset: batch.reset,
+  };
+}
+
+/* ---- src/moon.js ---- */
+// Purpose: Compute where the moon sits in the sky. It rises on the left in an
+// arc, stands still for a moment at the top centre, then sets on the right,
+// and starts again. Pure maths, so the path can be tested without a browser.
+
+const MOON_RISE = 10; // seconds to climb from the left horizon to the top
+const MOON_HOLD = 3; // seconds the moon stays at the highest point
+const MOON_SET = 10; // seconds to sink down to the right horizon
+const MOON_CYCLE = MOON_RISE + MOON_HOLD + MOON_SET;
+
+const MOON_RADIUS = 0.1; // half width of the disc in clip space (-1..1)
+
+const HORIZON = -1.1; // clip-space height where the moon is fully off screen
+const TOP = 0.72; // clip-space height at the highest point (below the HUD bar)
+const LEFT = -1.2; // clip-space x of the rising moon
+const RIGHT = 1.2; // clip-space x of the setting moon
+
+/**
+ * Position of the moon centre in clip space at a given time.
+ * Returns { x, y, altitude, phase } with altitude 0 at the horizon and 1 at the
+ * top, so the renderer can dim the moon near the horizon.
+ */
+function moonPosition(time) {
+  const cycle = ((time % MOON_CYCLE) + MOON_CYCLE) % MOON_CYCLE;
+
+  if (cycle < MOON_RISE) {
+    // Rising: 2t - t^2 is steep at the start and flattens as it reaches the top.
+    const t = cycle / MOON_RISE;
+    const altitude = 2 * t - t * t;
+    return { x: LEFT + (0 - LEFT) * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "rise" };
+  }
+
+  if (cycle < MOON_RISE + MOON_HOLD) {
+    return { x: 0, y: TOP, altitude: 1, phase: "high" };
+  }
+
+  // Setting: mirror image of the rise, so the arc is symmetric.
+  const t = (cycle - MOON_RISE - MOON_HOLD) / MOON_SET;
+  const altitude = 1 - t * t;
+  return { x: RIGHT * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "set" };
+}
+
+/**
+ * Colour of the moon for a given altitude: warm and dim near the horizon,
+ * bright and pale when it is high in the sky.
+ */
+function moonTint(altitude) {
+  const t = Math.max(0, Math.min(1, altitude));
+  return [0.62 + 0.38 * t, 0.52 + 0.44 * t, 0.42 + 0.52 * t];
+}
+
+/* ---- src/drawSky.js ---- */
+// Purpose: Draw the fixed sky of the scene: the vertical gradient, the stars,
+// the slowly drifting clouds and the moon on its arc. Nothing here moves with
+// the camera, which is what makes the sky read as infinitely far away.
+
+
+
+
+// Sky gradient: dark blue at the top, pale near the horizon.
+const SKY_TOP_COLOUR = [0.09, 0.14, 0.26];
+const SKY_BOTTOM_COLOUR = [0.6, 0.76, 0.84];
+
+// Stars are placed by a fixed formula instead of being stored, so the sky is
+// the same in every run and costs no memory.
+const STAR_COUNT = 42;
+const STAR_STEP_X = 0.049; // horizontal distance between two stars
+const STAR_STEP_Y = 0.137; // vertical distance between two stars
+const STAR_WRAP_X = 2; // clip space width the star field is repeated over
+const STAR_WRAP_Y = 0.85; // clip space height the star field is repeated over
+const STAR_BOTTOM = 0.06; // stars start above the horizon, not at its edge
+const STAR_SIZE = 0.006; // one star is a tiny square
+const STAR_COLOUR = [0.85, 0.9, 0.95];
+
+// Clouds drift with the frame time and wrap around the screen.
+const CLOUD_COUNT = 6;
+const CLOUD_STEP_X = 0.42; // horizontal distance between two clouds
+const CLOUD_STEP_Y = 0.31; // vertical distance between two clouds
+const CLOUD_WRAP_X = 2.4; // width of the drift before a cloud starts again
+const CLOUD_WRAP_Y = 0.62; // height the cloud band is repeated over
+const CLOUD_BOTTOM = 0.16; // lowest cloud in clip space
+const CLOUD_LEFT_EDGE = -1.2; // a wrapped cloud enters just outside the screen
+const CLOUD_DRIFT_SPEED = 0.012; // clip space per second: barely noticeable
+const CLOUD_ALPHA = 0.55; // clouds stay translucent
+const CLOUD_HAZE_COLOUR = [0.4, 0.5, 0.6];
+const CLOUD_CORE_COLOUR = [0.45, 0.55, 0.65];
+const CLOUD_SHADE_COLOUR = [0.38, 0.47, 0.57];
+
+// One cloud is a stack of thin haze strips; the offsets keep them overlapping.
+const CLOUD_STRIPS = [
+  { x: 0, y: 0, w: 0.42, h: 0.035, colour: CLOUD_HAZE_COLOUR },
+  { x: 0.08, y: 0.035, w: 0.24, h: 0.03, colour: CLOUD_CORE_COLOUR },
+  { x: 0.05, y: -0.02, w: 0.14, h: 0.02, colour: CLOUD_SHADE_COLOUR },
+];
+
+// The moon is a photo disc plus a soft halo that lights the sky around it.
+const MOON_HALO_FACTOR = 1.9; // the halo is wider than the disc
+const MOON_HALO_LIGHT = 0.3; // how much white is mixed into the halo
+const MOON_HALO_ALPHA = 0.16; // halo strength when the moon stands low
+const MOON_HALO_GAIN = 0.1; // extra halo strength at full altitude
+
+/** Paint the sky gradient and the stars on top of it. */
+function drawSky(painter) {
+  painter.skyGradient(SKY_TOP_COLOUR, SKY_BOTTOM_COLOUR);
+
+  for (let star = 0; star < STAR_COUNT; star++) {
+    const x = -1 + ((star * STAR_STEP_X) % STAR_WRAP_X);
+    const y = STAR_BOTTOM + ((star * STAR_STEP_Y) % STAR_WRAP_Y);
+    painter.rectClip(x, y, STAR_SIZE, STAR_SIZE, STAR_COLOUR);
+  }
+}
+
+/** Draw the thin drifting haze strips. */
+function drawClouds(painter, time) {
+  for (let cloud = 0; cloud < CLOUD_COUNT; cloud++) {
+    const x = ((cloud * CLOUD_STEP_X + time * CLOUD_DRIFT_SPEED) % CLOUD_WRAP_X) + CLOUD_LEFT_EDGE;
+    const y = CLOUD_BOTTOM + ((cloud * CLOUD_STEP_Y) % CLOUD_WRAP_Y);
+
+    for (const strip of CLOUD_STRIPS) {
+      painter.rectClip(x + strip.x, y + strip.y, strip.w, strip.h, strip.colour, CLOUD_ALPHA);
+    }
+  }
+}
+
+/**
+ * Draw the moon: a soft halo plus the photo disc, or a flat disc when the
+ * photo is missing. Called before the skyline so towers can hide the moon
+ * while it rises and sets.
+ */
+function drawMoon(painter, time) {
+  const moon = moonPosition(time);
+  const tint = moonTint(moon.altitude);
+  const haloAlpha = MOON_HALO_ALPHA + MOON_HALO_GAIN * moon.altitude;
+
+  painter.discClip(moon.x, moon.y, MOON_RADIUS * MOON_HALO_FACTOR, mix(tint, WHITE, MOON_HALO_LIGHT), haloAlpha);
+
+  if (painter.hasTexture("moon")) {
+    painter.discTex(moon.x, moon.y, MOON_RADIUS, tint, "moon");
+  } else {
+    painter.discClip(moon.x, moon.y, MOON_RADIUS, tint);
+  }
+}
+
+/* ---- src/drawCity.js ---- */
+// Purpose: Draw the city skyline and the hills behind the playable level.
+// Each layer is moved by a scaled camera instead of scaled world data, which is
+// what makes it read as distance (see design-guidelines/background-parallax.md).
+
+
+
+
+
+// Parallax factors: the smaller the factor, the slower a layer moves, so the
+// eye reads the order as distance. The vertical factors stay smaller than the
+// horizontal ones because the player mostly runs sideways: strong vertical
+// shifts would make the buildings slide up and down and distract from the
+// platforms.
+const PARALLAX_FAR_X = 0.22;
+const PARALLAX_FAR_Y = 0.12;
+const PARALLAX_NEAR_X = 0.48;
+const PARALLAX_NEAR_Y = 0.28;
+
+// Distant buildings are hazier and lighter, the ones in front are darker:
+// depth is expressed by value, not by blur.
+const FAR_BUILDING_COLOUR = [0.24, 0.31, 0.4];
+const NEAR_BUILDING_COLOUR = [0.16, 0.21, 0.29];
+const FAR_HILL_COLOUR = [0.2, 0.28, 0.36];
+
+// The lighter roof edge that makes a tower look like a lit solid.
+const ROOF_EDGE_INSET = 0.08; // the edge does not reach the wall corners
+const ROOF_EDGE_WIDTH = 0.84; // of the building width
+const ROOF_EDGE_HEIGHT = 0.5;
+const ROOF_EDGE_LIGHT = 0.1; // of white mixed into the wall colour
+
+// Window grid. Rows are counted from the roof downwards because the roof is
+// the only fixed reference of a tower.
+const WINDOW_STEP_X = 1.4; // distance between two window columns
+const WINDOW_STEP_Y = 1.7; // distance between two window rows
+const WINDOW_WIDTH = 0.7;
+const WINDOW_HEIGHT = 0.9;
+const WINDOW_SIDE_MARGIN = 0.35; // first window is set in from the wall
+const WINDOW_ROOF_GAP = 1.2; // first row sits below the roof
+const MAX_WINDOW_ROWS = 16; // a tower is never drawn with more rows
+const WINDOW_HASH_COLUMN = 97; // mixes the building id into the window pattern
+
+// Lit windows: the near layer has more light on, and a few windows blink over
+// time so the city looks alive.
+const LIT_CHANCE_NEAR = 0.6;
+const LIT_CHANCE_FAR = 0.3;
+const BLINK_HASH_MIN = 0.88; // share of windows that may blink
+const BLINK_SPEED = 1.5; // how often the blinking windows swap
+const LIT_COLOUR_NEAR = [0.93, 0.78, 0.38];
+const LIT_COLOUR_FAR = [0.62, 0.68, 0.55];
+const DARK_WINDOW_MIX = 0.3; // unlit windows are darker than the wall
+
+// Roof additions of the near layer only. The two salts keep the mast and the
+// wing of one building from appearing together.
+const ANTENNA_HASH_SALT = 17;
+const ANTENNA_HASH_MIN = 0.6; // building id hash above which a mast appears
+const ANTENNA_X_FACTOR = 0.45; // of the building width
+const ANTENNA_WIDTH = 0.2;
+const ANTENNA_HEIGHT = 1.8;
+const ANTENNA_COLOUR = [0.36, 0.42, 0.5];
+const SIDE_TOWER_HASH_SALT = 29;
+const SIDE_TOWER_HASH_MIN = 0.7; // building id hash above which a wing appears
+const SIDE_TOWER_WIDTH = 0.6;
+const SIDE_TOWER_HEIGHT = 0.5;
+const SIDE_TOWER_HEIGHT_FACTOR = 0.5; // of the building height, measured down
+const SIDE_TOWER_COLOUR = [0.3, 0.36, 0.44];
+
+/**
+ * Draw the far city layer and the hills in front of it. The hills use the same
+ * slow camera as the far towers, so both layers move at one speed.
+ */
+function drawFarLayer(painter, world, cam, time) {
+  const farCam = { x: cam.x * PARALLAX_FAR_X, y: cam.y * PARALLAX_FAR_Y };
+
+  for (const building of world.buildings) {
+    if (building.layer === SKYLINE_FAR_LAYER) drawBuilding(painter, building, farCam, false, time);
+  }
+  for (const hill of world.hills) {
+    drawHill(painter, hill, farCam);
+  }
+}
+
+/** Draw the nearer city layer, which moves faster than the far one. */
+function drawNearLayer(painter, world, cam, time) {
+  const nearCam = { x: cam.x * PARALLAX_NEAR_X, y: cam.y * PARALLAX_NEAR_Y };
+
+  for (const building of world.buildings) {
+    if (building.layer === SKYLINE_NEAR_LAYER) drawBuilding(painter, building, nearCam, true, time);
+  }
+}
+
+/**
+ * Draw one tower. `building.y` is the ground line of its lot, but the tower is
+ * drawn down past the bottom of the screen so it never looks cut off in
+ * mid-air, whatever the camera does.
+ */
+function drawBuilding(painter, building, cam, isNear, time) {
+  const wallColour = isNear ? NEAR_BUILDING_COLOUR : FAR_BUILDING_COLOUR;
+  const roof = building.y + building.h;
+  const base = painter.belowView(cam);
+
+  painter.rect(building.x, base, building.w, roof - base, wallColour, cam);
+  painter.rect(building.x + building.w * ROOF_EDGE_INSET, roof, building.w * ROOF_EDGE_WIDTH, ROOF_EDGE_HEIGHT, mix(wallColour, WHITE, ROOF_EDGE_LIGHT), cam);
+
+  drawWindows(painter, building, cam, isNear, time, wallColour, roof, base);
+  drawRoofAdditions(painter, building, cam, isNear, roof);
+}
+
+/** Light the window grid of a tower, counted from the roof downwards. */
+function drawWindows(painter, building, cam, isNear, time, wallColour, roof, base) {
+  const columns = Math.max(1, Math.floor(building.w / WINDOW_STEP_X));
+  // Rows below the view are dropped by the visibility test inside rect(), so
+  // drawing the full grid costs nothing.
+  const rows = Math.max(1, Math.min(MAX_WINDOW_ROWS, Math.floor((roof - base) / WINDOW_STEP_Y)));
+  const litChance = isNear ? LIT_CHANCE_NEAR : LIT_CHANCE_FAR;
+
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const pattern = hash(building.id * WINDOW_HASH_COLUMN + row, column);
+      const blinking = pattern > BLINK_HASH_MIN && Math.floor(time * BLINK_SPEED + building.id + row) % 2 === 0;
+      const isLit = pattern < litChance || blinking;
+
+      const windowColour = isLit
+        ? (isNear ? LIT_COLOUR_NEAR : LIT_COLOUR_FAR)
+        : mix(wallColour, BLACK, DARK_WINDOW_MIX);
+
+      painter.rect(
+        building.x + WINDOW_SIDE_MARGIN + column * WINDOW_STEP_X,
+        roof - WINDOW_ROOF_GAP - row * WINDOW_STEP_Y,
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+        windowColour,
+        cam
+      );
+    }
+  }
+}
+
+/** Add a mast or a side wing to some of the near towers. */
+function drawRoofAdditions(painter, building, cam, isNear, roof) {
+  if (!isNear) return;
+
+  if (hash(building.id, 17) > ANTENNA_HASH_MIN) {
+    painter.rect(building.x + building.w * ANTENNA_X_FACTOR, roof + ROOF_EDGE_HEIGHT, ANTENNA_WIDTH, ANTENNA_HEIGHT, ANTENNA_COLOUR, cam);
+  }
+  if (hash(building.id, 29) > SIDE_TOWER_HASH_MIN) {
+    painter.rect(
+      building.x - SIDE_TOWER_WIDTH,
+      roof - building.h * SIDE_TOWER_HEIGHT_FACTOR,
+      SIDE_TOWER_WIDTH,
+      SIDE_TOWER_HEIGHT,
+      SIDE_TOWER_COLOUR,
+      cam
+    );
+  }
+}
+
+/** Draw one background hill as a plain block that runs off the screen. */
+function drawHill(painter, hill, cam) {
+  const base = painter.belowView(cam);
+  const peak = hill.y + hill.h * 0.5; // only the lower half of a hill shows
+  painter.rect(hill.x, base, hill.w, peak - base, FAR_HILL_COLOUR, cam);
+}
+
+/* ---- src/drawLevel.js ---- */
+// Purpose: Draw the playable level itself: the ground and floating platforms
+// with their brick or plank surface, the walkable top edge, the grass on top of
+// ground blocks and the scenery props. A platform shows a real photo when
+// textures.js delivered one, otherwise a pattern is computed from its own
+// coordinates, which keeps the world data small and the look reproducible.
+
+
+
+
+// The starting wall: a stone pillar with a mortar seam in every block row.
+const WALL_BODY_COLOUR = [0.33, 0.36, 0.43];
+const WALL_SEAM_COLOUR = [0.26, 0.29, 0.35];
+const WALL_SEAM_THICKNESS = 0.12;
+const WALL_SEAM_OFFSET = 0.35; // the seam sits inside a row, not on its edge
+
+// Bodies and top surfaces of the two platform kinds: ground is thick and green,
+// a floating platform is thin and warm, so the player sees the difference.
+const GROUND_BODY_COLOUR = [0.31, 0.4, 0.32];
+const GROUND_TOP_COLOUR = [0.41, 0.76, 0.44];
+const FLOAT_BODY_COLOUR = [0.55, 0.49, 0.42];
+const FLOAT_TOP_COLOUR = [0.86, 0.78, 0.58];
+
+// Photo textures: one brick photo covers three world units; the wood planks are
+// smaller because the planks themselves are smaller.
+const BRICK_TEXTURE_NAME = "brick";
+const WOOD_TEXTURE_NAME = "wood";
+const BRICK_TILE = 3; // world units per photo tile
+const WOOD_TILE = 2;
+
+// One thin mortar line keeps the brick photo connected to the look of the game
+// without hiding the photograph.
+const PHOTO_SEAM_LIFT = 0.5; // measured down from the top of the block
+const PHOTO_SEAM_THICKNESS = 0.1;
+const PHOTO_SEAM_MIX = 0.2; // of black mixed into the body colour
+
+// Fallback brick pattern, used when the photo is missing: mortar lines plus a
+// few bricks in a slightly lighter shade.
+const BRICK_MORTAR_MIX = 0.22; // of black mixed into the body colour
+const BRICK_MODULE = 1; // one brick row is one world unit tall
+const BRICK_ROW_SEAM_OFFSET = 0.9; // the seam sits near the top of a row
+const BRICK_SEAM_THICKNESS = 0.1;
+const BRICK_SEAM_HEIGHT = 0.9;
+const BRICK_ROW_OFFSET = 0.5; // every other row is shifted by half a brick
+const BRICK_SEAM_EDGE_GUARD = 0.05; // no vertical seam right at the edge
+const BRICK_SHADE_CHANCE = 0.28; // share of bricks that get a lighter shade
+const BRICK_SHADE_INSET_X = 0.1;
+const BRICK_SHADE_INSET_Y = 0.12;
+const BRICK_SHADE_WIDTH = 0.8;
+const BRICK_SHADE_HEIGHT = 0.72;
+const BRICK_SHADE_LIGHT_MIX = 0.07; // of white mixed into the body colour
+
+// The lighter strip along the walkable surface that makes a block look lit.
+const TOP_EDGE_HEIGHT = 0.35;
+
+// Grass on the walkable surface.
+const GRASS_BLADES_PER_UNIT = 2; // blades per world unit of width
+const GRASS_SIDE_MARGIN = 0.2; // the first blade is set in from the edge
+const GRASS_STEP = 0.5; // distance between two blades
+const GRASS_JITTER = 0.25; // random shift so the blades are not a fence
+const GRASS_MIN_HEIGHT = 0.15;
+const GRASS_GROWTH = 0.4; // extra height taken by the random part
+const GRASS_WIDTH = 0.1;
+const GRASS_BLADE_COLOUR = [0.18, 0.44, 0.28];
+const GRASS_BLADE_MIX = 0.4; // of the blade colour mixed into the surface
+
+// One world coordinate scaled by this factor seeds every per-brick and
+// per-blade decision, so the pattern is stable for a platform.
+const COORD_HASH_SCALE = 10;
+
+// Scenery colours. Every prop is decoration only and never part of a collision.
+const BUSH_COLOUR = [0.28, 0.58, 0.4];
+const BUSH_TOP_COLOUR = [0.4, 0.72, 0.5];
+const BUSH_LIGHT_COLOUR = [0.43, 0.76, 0.52];
+const BUSH_LEAF_COLOUR = [0.2, 0.44, 0.33];
+const BUSH_LEAF_SIZE = 0.14;
+const TREE_TRUNK_COLOUR = [0.38, 0.29, 0.22];
+const TREE_CANOPY_COLOUR = [0.33, 0.6, 0.43];
+const TREE_CANOPY_LIGHT_COLOUR = [0.45, 0.72, 0.52];
+const TREE_LEAF_COLOUR = [0.22, 0.45, 0.35];
+const TREE_LEAF_SIZE = 0.16;
+const FLOWER_STEM_COLOUR = [0.3, 0.55, 0.4];
+const FLOWER_HEAD_COLOUR = [0.86, 0.5, 0.6];
+const FLOWER_HEAD_TOP_COLOUR = [0.95, 0.66, 0.72];
+const FLOWER_CORE_COLOUR = [0.98, 0.86, 0.4];
+const ROCK_COLOUR = [0.49, 0.51, 0.55];
+const ROCK_TOP_COLOUR = [0.58, 0.6, 0.64];
+const ROCK_SHADE_COLOUR = [0.42, 0.44, 0.48];
+const LAMP_POLE_COLOUR = [0.3, 0.33, 0.38];
+const LAMP_POLE_WIDTH = 0.16;
+const LAMP_GLOW_COLOUR = [0.95, 0.85, 0.45];
+const LAMP_GLOW_TOP_COLOUR = [1, 0.95, 0.65];
+const LAMP_GLOW_WIDTH = 0.76;
+const LAMP_GLOW_HEIGHT = 0.5;
+const LAMP_GLOW_SIDE_OFFSET = 0.3; // the lamp head hangs over the pole
+const LAMP_GLOW_TOP_LIFT = 0.5; // height of the head above the top of the pole
+const LAMP_HOUSING_COLOUR = [0.62, 0.56, 0.4];
+const LAMP_HOUSING_WIDTH = 1.16;
+const LAMP_HOUSING_HEIGHT = 0.4;
+const LAMP_HOUSING_SIDE_OFFSET = 0.5;
+const LAMP_HOUSING_TOP_LIFT = 0.9; // height of the housing above the top
+
+/**
+ * Draw one platform: the photo body when the texture arrived, otherwise the
+ * procedural pattern, then the top edge and the grass of walkable ground.
+ */
+function drawPlatform(painter, platform, cam) {
+  if (platform.kind === "wall") {
+    drawWall(painter, platform, cam);
+    return;
+  }
+
+  const isGround = platform.kind === "ground";
+  const body = isGround ? GROUND_BODY_COLOUR : FLOAT_BODY_COLOUR;
+  const surface = isGround ? GROUND_TOP_COLOUR : FLOAT_TOP_COLOUR;
+
+  // The photo is one textured quad and is flushed right away, so the flat
+  // details that follow always end up on top of it.
+  const photo = painter.rectTex(
+    platform.x,
+    platform.y,
+    platform.w,
+    platform.h,
+    body,
+    cam,
+    isGround ? BRICK_TEXTURE_NAME : WOOD_TEXTURE_NAME,
+    isGround ? BRICK_TILE : WOOD_TILE
+  );
+  painter.flushTextures();
+
+  if (photo) {
+    painter.rect(
+      platform.x,
+      platform.y + platform.h - PHOTO_SEAM_LIFT,
+      platform.w,
+      PHOTO_SEAM_THICKNESS,
+      mix(body, BLACK, PHOTO_SEAM_MIX),
+      cam
+    );
+  } else {
+    drawBrickPattern(painter, platform, cam, body);
+  }
+
+  painter.rect(platform.x, platform.top - TOP_EDGE_HEIGHT, platform.w, TOP_EDGE_HEIGHT, surface, cam);
+
+  if (isGround) drawGrass(painter, platform, cam, surface);
+}
+
+/** Draw the tall stone pillar that stops the player at the left edge. */
+function drawWall(painter, platform, cam) {
+  painter.rect(platform.x, platform.y, platform.w, platform.h, WALL_BODY_COLOUR, cam);
+
+  for (let row = 0; row < Math.floor(platform.h); row++) {
+    painter.rect(platform.x, platform.y + row + WALL_SEAM_OFFSET, platform.w, WALL_SEAM_THICKNESS, WALL_SEAM_COLOUR, cam);
+  }
+}
+
+/** Mortar lines and a few lighter bricks, all derived from the coordinates. */
+function drawBrickPattern(painter, platform, cam, body) {
+  const mortar = mix(body, BLACK, BRICK_MORTAR_MIX);
+  const columns = Math.floor(platform.w / BRICK_MODULE);
+  const rows = Math.floor(platform.h / BRICK_MODULE);
+
+  for (let row = 0; row < rows; row++) {
+    const rowY = platform.y + row * BRICK_MODULE;
+    painter.rect(platform.x, rowY + BRICK_ROW_SEAM_OFFSET, platform.w, BRICK_SEAM_THICKNESS, mortar, cam);
+
+    const shift = row % 2 === 0 ? 0 : BRICK_ROW_OFFSET;
+    for (let column = 0; column <= columns; column++) {
+      const seamX = platform.x + column * BRICK_MODULE + shift;
+      if (seamX < platform.x + platform.w - BRICK_SEAM_EDGE_GUARD) {
+        painter.rect(seamX, rowY, BRICK_SEAM_THICKNESS, BRICK_SEAM_HEIGHT, mortar, cam);
+      }
+    }
+
+    for (let column = 0; column < columns; column++) {
+      const pattern = hash(
+        Math.round(platform.x * COORD_HASH_SCALE) + column,
+        Math.round(platform.y * COORD_HASH_SCALE) + row
+      );
+      if (pattern < BRICK_SHADE_CHANCE) {
+        painter.rect(
+          platform.x + column * BRICK_MODULE + shift + BRICK_SHADE_INSET_X,
+          rowY + BRICK_SHADE_INSET_Y,
+          BRICK_SHADE_WIDTH,
+          BRICK_SHADE_HEIGHT,
+          mix(body, WHITE, BRICK_SHADE_LIGHT_MIX),
+          cam
+        );
+      }
+    }
+  }
+}
+
+/** The grass blades standing on the walkable surface of a ground block. */
+function drawGrass(painter, platform, cam, surface) {
+  const bladeCount = Math.floor(platform.w * GRASS_BLADES_PER_UNIT);
+  const bladeColour = mix(surface, GRASS_BLADE_COLOUR, GRASS_BLADE_MIX);
+
+  for (let blade = 0; blade < bladeCount; blade++) {
+    const x =
+      platform.x + GRASS_SIDE_MARGIN + blade * GRASS_STEP + hash(blade, Math.round(platform.top * COORD_HASH_SCALE)) * GRASS_JITTER;
+    if (x > platform.x + platform.w - GRASS_SIDE_MARGIN) break;
+
+    const height = GRASS_MIN_HEIGHT + hash(blade, Math.round(platform.y * COORD_HASH_SCALE)) * GRASS_GROWTH;
+    painter.rect(x, platform.top, GRASS_WIDTH, height, bladeColour, cam);
+  }
+}
+
+/** Draw scenery: bush, tree, flower, rock or street lamp. */
+function drawDecor(painter, decor, cam) {
+  const { x, y, w, h } = decor;
+
+  if (decor.type === "bush") {
+    painter.rect(x, y, w, h, BUSH_COLOUR, cam, BUSH_TOP_COLOUR);
+    painter.rect(x + w * 0.18, y + h * 0.6, w * 0.64, h * 0.4, BUSH_LIGHT_COLOUR, cam);
+    painter.rect(x + w * 0.1, y + h * 0.15, BUSH_LEAF_SIZE, BUSH_LEAF_SIZE, BUSH_LEAF_COLOUR, cam);
+    painter.rect(x + w * 0.6, y + h * 0.35, BUSH_LEAF_SIZE, BUSH_LEAF_SIZE, BUSH_LEAF_COLOUR, cam);
+  } else if (decor.type === "tree") {
+    painter.rect(x, y, w, h, TREE_TRUNK_COLOUR, cam);
+    painter.rect(x - w * 0.6, y + h * 0.55, w * 2.2, h * 0.45, TREE_CANOPY_COLOUR, cam);
+    painter.rect(x - w * 0.3, y + h * 0.7, w * 1.2, h * 0.25, TREE_CANOPY_LIGHT_COLOUR, cam);
+    painter.rect(x - w * 0.5, y + h * 0.6, TREE_LEAF_SIZE, TREE_LEAF_SIZE, TREE_LEAF_COLOUR, cam);
+  } else if (decor.type === "flower") {
+    painter.rect(x + w * 0.4, y, w * 0.2, h, FLOWER_STEM_COLOUR, cam);
+    painter.rect(x, y + h * 0.55, w, h * 0.45, FLOWER_HEAD_COLOUR, cam, FLOWER_HEAD_TOP_COLOUR);
+    painter.rect(x + w * 0.35, y + h * 0.7, w * 0.3, h * 0.2, FLOWER_CORE_COLOUR, cam);
+  } else if (decor.type === "rock") {
+    painter.rect(x, y, w, h, ROCK_COLOUR, cam, ROCK_TOP_COLOUR);
+    painter.rect(x + w * 0.2, y + h * 0.3, w * 0.3, h * 0.3, ROCK_SHADE_COLOUR, cam);
+  } else if (decor.type === "lamp") {
+    drawStreetLamp(painter, decor, cam);
+  }
+}
+
+/** A street lamp: the pole, the glowing head and its dark housing. */
+function drawStreetLamp(painter, decor, cam) {
+  const { x, y, h } = decor;
+
+  painter.rect(x, y, LAMP_POLE_WIDTH, h, LAMP_POLE_COLOUR, cam);
+  painter.rect(x - LAMP_GLOW_SIDE_OFFSET, y + h - LAMP_GLOW_TOP_LIFT, LAMP_GLOW_WIDTH, LAMP_GLOW_HEIGHT, LAMP_GLOW_COLOUR, cam, LAMP_GLOW_TOP_COLOUR);
+  painter.rect(x - LAMP_HOUSING_SIDE_OFFSET, y + h - LAMP_HOUSING_TOP_LIFT, LAMP_HOUSING_WIDTH, LAMP_HOUSING_HEIGHT, LAMP_HOUSING_COLOUR, cam);
+}
+
+/* ---- src/drawActors.js ---- */
+// Purpose: Draw the actors of the level: the patrolling enemies and the player.
+// Both are built from a few boxes with a lighter top edge, and both animate
+// their feet with the frame time so they look like they are walking.
+
+// Enemies: purple blocks with one visible eye and two stepping feet.
+const ENEMY_BODY_COLOUR = [0.52, 0.31, 0.66];
+const ENEMY_TOP_COLOUR = [0.71, 0.45, 0.82];
+const ENEMY_SQUASH_SHRINK = 0.7; // part of the height a fully squashed enemy loses
+const ENEMY_SQUASH_HIDE_FACE = 0.9; // from this squash on, face and feet are gone
+const ENEMY_EYE_SIZE = 0.3;
+const ENEMY_EYE_COLOUR = [0.98, 0.96, 0.9];
+const ENEMY_PUPIL_COLOUR = [0.1, 0.1, 0.12];
+const ENEMY_PUPIL_SIZE = 0.14;
+const ENEMY_PUPIL_INSET = 0.12; // pupil sits in the front corner of the eye
+const ENEMY_EYE_HEIGHT_FACTOR = 0.45; // of the enemy height
+const ENEMY_EYE_FRONT_MARGIN = 0.45; // measured from the front edge
+const ENEMY_EYE_BACK_MARGIN = 0.15; // measured from the back edge
+const ENEMY_LEG_COLOUR = [0.34, 0.2, 0.44];
+const ENEMY_LEG_WIDTH = 0.25;
+const ENEMY_LEG_HEIGHT = 0.2;
+const ENEMY_LEG_SIDE_MARGIN = 0.1; // first foot is set in from the edge
+const ENEMY_LEG_SWING = 0.25; // how far the feet lift
+const ENEMY_STEP_SPEED = 6; // how fast the stepping animation runs
+
+// Player: an orange body, a blue shirt and a face that looks where it runs.
+const PLAYER_BODY_COLOUR = [0.92, 0.47, 0.33];
+const PLAYER_TOP_COLOUR = [0.99, 0.55, 0.42];
+const PLAYER_SHIRT_COLOUR = [0.23, 0.55, 0.86];
+const PLAYER_SHIRT_HIGHLIGHT_COLOUR = [0.3, 0.68, 0.95];
+const PLAYER_SHIRT_HEIGHT = 0.45;
+const PLAYER_SHIRT_HIGHLIGHT_HEIGHT = 0.12;
+const PLAYER_SHIRT_INSET = 0.05; // the shirt stops short of the body sides
+const PLAYER_EYE_COLOUR = [0.98, 0.97, 0.93];
+const PLAYER_EYE_WIDTH = 0.3;
+const PLAYER_EYE_HEIGHT = 0.32;
+const PLAYER_EYE_LIFT = 0.95; // below the head, in world units
+const PLAYER_EYE_FRONT_MARGIN = 0.12;
+const PLAYER_EYE_BACK_MARGIN = 0.42;
+const PLAYER_PUPIL_COLOUR = [0.12, 0.14, 0.18];
+const PLAYER_PUPIL_WIDTH = 0.13;
+const PLAYER_PUPIL_HEIGHT = 0.16;
+const PLAYER_PUPIL_INSET = 0.12;
+const PLAYER_PUPIL_LIFT = 0.85;
+const PLAYER_LEG_COLOUR = [0.7, 0.33, 0.25];
+const PLAYER_LEG_WIDTH = 0.25;
+const PLAYER_LEG_HEIGHT = 0.28;
+const PLAYER_LEG_SIDE_MARGIN = 0.1;
+const PLAYER_LEG_SWING = 0.28; // how far the stride lifts the feet
+const PLAYER_STEP_SPEED = 9; // how fast the running animation runs
+const PLAYER_AIRBORNE_LEG_LIFT = 0.1; // feet stay tucked while in the air
+const PLAYER_ARM_COLOUR = [0.85, 0.4, 0.3];
+const PLAYER_ARM_WIDTH = 0.2;
+const PLAYER_ARM_HEIGHT = 0.45;
+const PLAYER_ARM_SIDE_OFFSET = 0.2; // the arms stick out beside the body
+const PLAYER_ARM_HEIGHT_FACTOR = 0.4; // of the body height
+
+/**
+ * Draw one patrolling enemy. A squashed enemy is flattened further every
+ * frame until its face and feet disappear.
+ */
+function drawEnemy(painter, enemy, cam, time) {
+  const height = enemy.h * (1 - enemy.squash * ENEMY_SQUASH_SHRINK);
+  painter.rect(enemy.x, enemy.y, enemy.w, height, ENEMY_BODY_COLOUR, cam, ENEMY_TOP_COLOUR);
+
+  if (enemy.squash >= ENEMY_SQUASH_HIDE_FACE) return;
+
+  const eyeY = enemy.y + height * ENEMY_EYE_HEIGHT_FACTOR;
+  const eyeX = enemy.dir > 0 ? enemy.x + enemy.w - ENEMY_EYE_FRONT_MARGIN : enemy.x + ENEMY_EYE_BACK_MARGIN;
+  painter.rect(eyeX, eyeY, ENEMY_EYE_SIZE, ENEMY_EYE_SIZE, ENEMY_EYE_COLOUR, cam);
+  painter.rect(eyeX + ENEMY_PUPIL_INSET, eyeY + ENEMY_PUPIL_INSET, ENEMY_PUPIL_SIZE, ENEMY_PUPIL_SIZE, ENEMY_PUPIL_COLOUR, cam);
+
+  const swing = ENEMY_LEG_SWING * Math.abs(Math.sin(time * ENEMY_STEP_SPEED + enemy.x));
+  painter.rect(enemy.x + ENEMY_LEG_SIDE_MARGIN, enemy.y - swing * 0.5, ENEMY_LEG_WIDTH, ENEMY_LEG_HEIGHT, ENEMY_LEG_COLOUR, cam);
+  painter.rect(enemy.x + enemy.w - ENEMY_LEG_SIDE_MARGIN - ENEMY_LEG_WIDTH, enemy.y - swing * 0.4, ENEMY_LEG_WIDTH, ENEMY_LEG_HEIGHT, ENEMY_LEG_COLOUR, cam);
+}
+
+/**
+ * Draw the player: body, shirt, face, stepping legs and arms. The legs only
+ * swing while the player stands on the ground.
+ */
+function drawPlayer(painter, player, cam, time) {
+  const { x, y, w, h } = player;
+
+  painter.rect(x, y, w, h, PLAYER_BODY_COLOUR, cam, PLAYER_TOP_COLOUR);
+  painter.rect(x + PLAYER_SHIRT_INSET, y + h - PLAYER_SHIRT_HEIGHT, w - PLAYER_SHIRT_INSET * 2, PLAYER_SHIRT_HEIGHT, PLAYER_SHIRT_COLOUR, cam);
+  painter.rect(x + PLAYER_SHIRT_INSET, y + h - PLAYER_SHIRT_HEIGHT, w - PLAYER_SHIRT_INSET * 2, PLAYER_SHIRT_HIGHLIGHT_HEIGHT, PLAYER_SHIRT_HIGHLIGHT_COLOUR, cam);
+
+  const eyeX = player.face > 0 ? x + PLAYER_EYE_FRONT_MARGIN : x + w - PLAYER_EYE_BACK_MARGIN;
+  painter.rect(eyeX, y + h - PLAYER_EYE_LIFT, PLAYER_EYE_WIDTH, PLAYER_EYE_HEIGHT, PLAYER_EYE_COLOUR, cam);
+  painter.rect(eyeX + PLAYER_PUPIL_INSET, y + h - PLAYER_PUPIL_LIFT, PLAYER_PUPIL_WIDTH, PLAYER_PUPIL_HEIGHT, PLAYER_PUPIL_COLOUR, cam);
+
+  drawSteppingLegs(painter, player, cam, time);
+
+  const armY = y + h * PLAYER_ARM_HEIGHT_FACTOR;
+  painter.rect(x - PLAYER_ARM_SIDE_OFFSET, armY, PLAYER_ARM_WIDTH, PLAYER_ARM_HEIGHT, PLAYER_ARM_COLOUR, cam);
+  painter.rect(x + w, armY, PLAYER_ARM_WIDTH, PLAYER_ARM_HEIGHT, PLAYER_ARM_COLOUR, cam);
+}
+
+/** Two feet that alternate with the frame time: running or tucked in air. */
+function drawSteppingLegs(painter, player, cam, time) {
+  const { x, y, w } = player;
+  const stride = Math.abs(Math.sin(time * PLAYER_STEP_SPEED)) * PLAYER_LEG_SWING;
+  const frontLift = player.onGround ? stride : PLAYER_AIRBORNE_LEG_LIFT;
+  const backLift = player.onGround ? PLAYER_LEG_SWING - stride : PLAYER_AIRBORNE_LEG_LIFT;
+
+  painter.rect(x + PLAYER_LEG_SIDE_MARGIN, y - frontLift, PLAYER_LEG_WIDTH, PLAYER_LEG_HEIGHT, PLAYER_LEG_COLOUR, cam);
+  painter.rect(x + w - PLAYER_LEG_SIDE_MARGIN - PLAYER_LEG_WIDTH, y - backLift, PLAYER_LEG_WIDTH, PLAYER_LEG_HEIGHT, PLAYER_LEG_COLOUR, cam);
+}
+
 /* ---- src/jets.js ---- */
 // Purpose: Handle the jet fighters that cross the sky every few seconds and
 // drop a bomb over the player - spawning, the drop, the fall and the explosion
@@ -803,172 +1974,184 @@ function distance(ax, ay, bx, by) {
   return Math.sqrt(dx * dx + dy * dy);
 }
 
-/* ---- src/moon.js ---- */
-// Purpose: Compute where the moon sits in the sky. It rises on the left in an
-// arc, stands still for a moment at the top centre, then sets on the right,
-// and starts again. Pure maths, so the path can be tested without a browser.
+/* ---- src/drawThreats.js ---- */
+// Purpose: Draw the threats that fall from the sky: the jet fighter, the
+// falling bomb with its warning markers and the explosion. The jets are drawn
+// last so they stay readable in front of the level, and the warning markers
+// show exactly where a bomb will hit.
 
-const MOON_RISE = 10; // seconds to climb from the left horizon to the top
-const MOON_HOLD = 3; // seconds the moon stays at the highest point
-const MOON_SET = 10; // seconds to sink down to the right horizon
-const MOON_CYCLE = MOON_RISE + MOON_HOLD + MOON_SET;
 
-const MOON_RADIUS = 0.1; // half width of the disc in clip space (-1..1)
 
-const HORIZON = -1.1; // clip-space height where the moon is fully off screen
-const TOP = 0.72; // clip-space height at the highest point (below the HUD bar)
-const LEFT = -1.2; // clip-space x of the rising moon
-const RIGHT = 1.2; // clip-space x of the setting moon
 
-/**
- * Position of the moon centre in clip space at a given time.
- * Returns { x, y, altitude, phase } with altitude 0 at the horizon and 1 at the
- * top, so the renderer can dim the moon near the horizon.
- */
-function moonPosition(time) {
-  const cycle = ((time % MOON_CYCLE) + MOON_CYCLE) % MOON_CYCLE;
 
-  if (cycle < MOON_RISE) {
-    // Rising: 2t - t^2 is steep at the start and flattens as it reaches the top.
-    const t = cycle / MOON_RISE;
-    const altitude = 2 * t - t * t;
-    return { x: LEFT + (0 - LEFT) * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "rise" };
-  }
+// Jet fighter: a light body, dark wings and a flickering engine flame.
+const JET_BODY_COLOUR = [0.8, 0.84, 0.9];
+const JET_BODY_LIGHT_MIX = 0.12; // of white mixed into the top edge
+const JET_DARK_COLOUR = [0.44, 0.49, 0.57];
+const JET_COCKPIT_COLOUR = [0.2, 0.26, 0.34];
+const JET_TRAIL_COLOUR = [0.55, 0.62, 0.7];
+const JET_TRAIL_HEIGHT = 0.22;
+const JET_TRAIL_HEIGHT_FACTOR = 0.35; // of the fuselage height
+const JET_TRAIL_BASE = 3; // shortest exhaust trail
+const JET_TRAIL_SWING = 2; // extra length added by the animation
+const JET_TRAIL_SPEED = 3; // how fast the trail pulses
+const JET_NOSE_LENGTH = 0.8;
+const JET_NOSE_HEIGHT_FACTOR = 0.4; // of the fuselage height
+const JET_NOSE_HEIGHT_OFFSET = 0.3; // measured up from the bottom of the body
+const JET_WING_INSET = 0.2; // of the fuselage length
+const JET_WING_HEIGHT = 0.55;
+const JET_WING_LENGTH_FACTOR = 0.55; // of the fuselage length
+const JET_WING_DROP = 0.55; // the wing sits under the fuselage
+const JET_TAIL_WIDTH = 0.5;
+const JET_TAIL_HEIGHT = 0.75;
+const JET_COCKPIT_INSET = 0.6; // of the fuselage length
+const JET_COCKPIT_LENGTH_FACTOR = 0.22; // of the fuselage length
+const JET_COCKPIT_HEIGHT = 0.32;
+const JET_COCKPIT_HEIGHT_FACTOR = 0.5; // of the fuselage height
+const JET_FLAME_COLOUR = [0.95, 0.62, 0.3];
+const JET_FLAME_BASE = 0.5; // shortest flame
+const JET_FLAME_SWING = 0.4; // extra length added by the animation
+const JET_FLAME_SPEED = 12; // how fast the flame flickers
 
-  if (cycle < MOON_RISE + MOON_HOLD) {
-    return { x: 0, y: TOP, altitude: 1, phase: "high" };
-  }
+// Falling bomb and its warning markers.
+const WARNING_BLINK_SPEED = 8; // the markers flash this often per second
+const WARNING_LINE_STEP = 0.8; // distance between two dashes of the drop line
+const WARNING_LINE_WIDTH = 0.14;
+const WARNING_LINE_HEIGHT = 0.4;
+const WARNING_LINE_BRIGHT = [0.95, 0.45, 0.35];
+const WARNING_LINE_DIM = [0.6, 0.3, 0.28];
+const GROUND_MARKER_WIDTH = 2.2;
+const GROUND_MARKER_HEIGHT = 0.22;
+const GROUND_MARKER_BRIGHT = [0.92, 0.36, 0.3];
+const GROUND_MARKER_DIM = [0.66, 0.26, 0.24];
+const MARKER_CORE_WIDTH = 0.8;
+const MARKER_CORE_HEIGHT = 0.3;
+const MARKER_CORE_BRIGHT = [1, 0.55, 0.4];
+const MARKER_CORE_DIM = [0.8, 0.4, 0.35];
+const BOMB_BODY_COLOUR = [0.32, 0.34, 0.39];
+const BOMB_BODY_TOP_COLOUR = [0.5, 0.52, 0.58];
+const BOMB_FIN_COLOUR = [0.45, 0.47, 0.52];
+const BOMB_FIN_WIDTH = 0.56;
+const BOMB_FIN_HEIGHT = 0.28;
+const BOMB_LIGHT_WIDTH = 0.2;
+const BOMB_LIGHT_HEIGHT = 0.28;
+const BOMB_LIGHT_SIDE = 0.1; // the fuse light is centred on the bomb
+const BOMB_LIGHT_BRIGHT = [1, 0.7, 0.3];
+const BOMB_LIGHT_DIM = [0.5, 0.35, 0.2];
 
-  // Setting: mirror image of the rise, so the arc is symmetric.
-  const t = (cycle - MOON_RISE - MOON_HOLD) / MOON_SET;
-  const altitude = 1 - t * t;
-  return { x: RIGHT * t, y: HORIZON + (TOP - HORIZON) * altitude, altitude, phase: "set" };
+// Explosion: smoke, flame and a hot core, all round and growing.
+const BLAST_START_SCALE = 0.4; // size at the moment of the blast
+const BLAST_GROWTH = 0.6; // extra size at the end of the blast
+const BLAST_LIFT_FACTOR = 0.6; // the fireball centre sits above the ground
+const SCORCH_HEIGHT = 0.18; // dark mark on the ground the bomb hit
+const SCORCH_COLOUR = [0.2, 0.22, 0.26];
+const SMOKE_COLOUR = [0.35, 0.33, 0.32];
+const FLAME_COLOUR = [0.92, 0.45, 0.22];
+const FLAME_SIZE_FACTOR = 0.72; // of the smoke radius
+const CORE_COLOUR = [1, 0.9, 0.55];
+const CORE_SIZE_FACTOR = 0.4; // of the smoke radius
+const FRAGMENT_COUNT = 6; // pieces thrown to each side
+const FRAGMENT_SIZE = 0.25;
+const FRAGMENT_SPREAD_BASE = 0.6; // of the blast radius
+const FRAGMENT_SPREAD_EXTRA = 0.8; // random part of the throw distance
+const FRAGMENT_RISE = 1.2; // fragments drift upwards as the blast ages
+const FRAGMENT_RISE_BACK = 1.5; // the pieces behind rise a little further
+
+/** Draw a jet fighter crossing the sky, nose pointed in its travel direction. */
+function drawJet(painter, jet, cam, time) {
+  const front = jet.dir > 0 ? jet.x + jet.w : jet.x;
+  const back = jet.dir > 0 ? jet.x : jet.x + jet.w;
+
+  // Exhaust trail behind the aircraft.
+  const trailLength = JET_TRAIL_BASE + JET_TRAIL_SWING * Math.abs(Math.sin(time * JET_TRAIL_SPEED + jet.id));
+  const trailX = jet.dir > 0 ? back - trailLength : back;
+  painter.rect(trailX, jet.y + jet.h * JET_TRAIL_HEIGHT_FACTOR, trailLength, JET_TRAIL_HEIGHT, JET_TRAIL_COLOUR, cam);
+
+  // Fuselage, nose cone, wing and tail fin.
+  painter.rect(jet.x, jet.y, jet.w, jet.h, JET_BODY_COLOUR, cam, mix(JET_BODY_COLOUR, WHITE, JET_BODY_LIGHT_MIX));
+  painter.rect(jet.dir > 0 ? front : front - JET_NOSE_LENGTH, jet.y + jet.h * JET_NOSE_HEIGHT_OFFSET, JET_NOSE_LENGTH, jet.h * JET_NOSE_HEIGHT_FACTOR, JET_BODY_COLOUR, cam);
+  painter.rect(jet.x + jet.w * JET_WING_INSET, jet.y - JET_WING_DROP, jet.w * JET_WING_LENGTH_FACTOR, JET_WING_HEIGHT, JET_DARK_COLOUR, cam);
+  painter.rect(jet.dir > 0 ? back : back - JET_TAIL_WIDTH, jet.y + jet.h, JET_TAIL_WIDTH, JET_TAIL_HEIGHT, JET_DARK_COLOUR, cam);
+  painter.rect(jet.x + jet.w * JET_COCKPIT_INSET, jet.y + jet.h * JET_COCKPIT_HEIGHT_FACTOR, jet.w * JET_COCKPIT_LENGTH_FACTOR, JET_COCKPIT_HEIGHT, JET_COCKPIT_COLOUR, cam);
+
+  // Flickering engine flame at the rear.
+  const flameLength = JET_FLAME_BASE + JET_FLAME_SWING * Math.abs(Math.sin(time * JET_FLAME_SPEED + jet.id));
+  painter.rect(jet.dir > 0 ? back - flameLength : back, jet.y + jet.h * JET_NOSE_HEIGHT_OFFSET, flameLength, jet.h * JET_NOSE_HEIGHT_FACTOR, JET_FLAME_COLOUR, cam);
 }
 
-/**
- * Colour of the moon for a given altitude: warm and dim near the horizon,
- * bright and pale when it is high in the sky.
- */
-function moonTint(altitude) {
-  const t = Math.max(0, Math.min(1, altitude));
-  return [0.62 + 0.38 * t, 0.52 + 0.44 * t, 0.42 + 0.52 * t];
+/** Draw a falling bomb, its dashed drop line and the blinking ground marker. */
+function drawBomb(painter, bomb, cam, time) {
+  // Every other frame the warning flashes, so the player sees it clearly.
+  const isBright = Math.floor(time * WARNING_BLINK_SPEED) % 2 === 0;
+
+  if (bomb.targetY !== null) drawBombWarning(painter, bomb, cam, isBright);
+
+  // The bomb itself: dark body, fins and a blinking fuse light.
+  painter.rect(bomb.x - bomb.w / 2, bomb.y, bomb.w, bomb.h, BOMB_BODY_COLOUR, cam, BOMB_BODY_TOP_COLOUR);
+  painter.rect(bomb.x - (BOMB_FIN_WIDTH_FACTOR * bomb.w) / 2, bomb.y + bomb.h, BOMB_FIN_WIDTH_FACTOR * bomb.w, BOMB_FIN_HEIGHT, BOMB_FIN_COLOUR, cam);
+  const lightY = bomb.y + bomb.h + BOMB_FIN_HEIGHT;
+  painter.rect(bomb.x - BOMB_LIGHT_SIDE, lightY, BOMB_LIGHT_WIDTH, BOMB_LIGHT_HEIGHT, isBright ? BOMB_LIGHT_BRIGHT : BOMB_LIGHT_DIM, cam);
+}
+
+/** Mark the drop line and the exact spot on the ground that will be hit. */
+function drawBombWarning(painter, bomb, cam, isBright) {
+  const lineColour = isBright ? WARNING_LINE_BRIGHT : WARNING_LINE_DIM;
+  for (let y = bomb.targetY; y < bomb.y; y += WARNING_LINE_STEP) {
+    painter.rect(bomb.x - WARNING_LINE_WIDTH / 2, y, WARNING_LINE_WIDTH, WARNING_LINE_HEIGHT, lineColour, cam);
+  }
+
+  // Danger marker on the ground: a wide bar with a bright core above it.
+  const markerColour = isBright ? GROUND_MARKER_BRIGHT : GROUND_MARKER_DIM;
+  painter.rect(bomb.x - GROUND_MARKER_WIDTH / 2, bomb.targetY, GROUND_MARKER_WIDTH, GROUND_MARKER_HEIGHT, markerColour, cam);
+
+  const coreColour = isBright ? MARKER_CORE_BRIGHT : MARKER_CORE_DIM;
+  painter.rect(bomb.x - MARKER_CORE_WIDTH / 2, bomb.targetY + GROUND_MARKER_HEIGHT, MARKER_CORE_WIDTH, MARKER_CORE_HEIGHT, coreColour, cam);
+}
+
+/** Draw an explosion: a growing fireball with a bright core and dark smoke. */
+function drawBlast(painter, blast, cam, time) {
+  const duration = blast.duration || BLAST_DURATION;
+  const age = Math.min(1, (time - blast.start) / duration);
+  const radius = blast.radius * (BLAST_START_SCALE + BLAST_GROWTH * age);
+  const centreY = blast.y + radius * BLAST_LIFT_FACTOR;
+
+  // Scorch mark on the solid ground the bomb hit.
+  painter.rect(blast.x - radius, blast.y, radius * 2, SCORCH_HEIGHT, SCORCH_COLOUR, cam);
+
+  painter.disc(blast.x, centreY, radius, SMOKE_COLOUR, cam);
+  painter.disc(blast.x, centreY, radius * FLAME_SIZE_FACTOR, FLAME_COLOUR, cam);
+  painter.disc(blast.x, centreY, radius * CORE_SIZE_FACTOR, CORE_COLOUR, cam);
+
+  drawBlastFragments(painter, blast, cam, age, radius, centreY);
+}
+
+/** Debris thrown to both sides; the hash keeps the scatter stable per blast. */
+function drawBlastFragments(painter, blast, cam, age, radius, centreY) {
+  for (let piece = 0; piece < FRAGMENT_COUNT; piece++) {
+    const spread = radius * (FRAGMENT_SPREAD_BASE + hash(Math.round(blast.x * 10), piece) * FRAGMENT_SPREAD_EXTRA);
+    painter.rect(blast.x + spread, centreY + age * FRAGMENT_RISE, FRAGMENT_SIZE, FRAGMENT_SIZE, SMOKE_COLOUR, cam);
+    painter.rect(blast.x - spread, centreY + age * FRAGMENT_RISE_BACK, FRAGMENT_SIZE, FRAGMENT_SIZE, SMOKE_COLOUR, cam);
+  }
 }
 
 /* ---- src/renderer.js ---- */
-// Purpose: Render the game world with WebGL (raw WebGL 1, no libraries) by
-// batching every visible box into a single triangle buffer per frame, add
-// procedural detail (grass, mortar lines, windows, bushes) and draw the few
-// real photo textures (moon, brick, wood) that src/textures.js loads.
+// Purpose: Draw one frame of the game with WebGL. This module creates the
+// context, the two quad batches and the painter, then calls the drawing modules
+// in the order that makes the picture correct: sky, skyline, level, actors,
+// threats. It never changes the game state, it only reads it.
 
 
 
 
 
 
-// belowBottom owns the skyline base line. It stays reachable from this module
-// because that is where the tests and the design notes look for it.
-{ belowBottom };
 
-const MAX_QUADS = 15000;
-const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
 
-const MAX_TEX_QUADS = 4000;
-const TEX_FLOATS_PER_VERTEX = 7; // x, y, u, v, r, g, b
 
-const VERTEX_SOURCE = `
-attribute vec2 pos;
-attribute vec3 color;
-attribute float alpha;
-varying vec3 vcolor;
-varying float valpha;
-void main() {
-  vcolor = color;
-  valpha = alpha;
-  gl_Position = vec4(pos, 0.0, 1.0);
-}`;
+// belowBottom lives in camera.js and the texture helpers in painter.js. They
+// stay reachable from here because that is where the tests look for them.
 
-const FRAGMENT_SOURCE = `
-precision mediump float;
-varying vec3 vcolor;
-varying float valpha;
-void main() {
-  gl_FragColor = vec4(vcolor, valpha);
-}`;
 
-const TEX_VERTEX_SOURCE = `
-attribute vec2 pos;
-attribute vec2 uv;
-attribute vec3 color;
-varying vec2 vuv;
-varying vec3 vcolor;
-void main() {
-  vuv = uv;
-  vcolor = color;
-  gl_Position = vec4(pos, 0.0, 1.0);
-}`;
-
-// A photo is multiplied into the flat game colour, so a texture never clashes
-// with the palette. `disc` turns a quad into a circle with a soft edge.
-const TEX_FRAGMENT_SOURCE = `
-precision mediump float;
-varying vec2 vuv;
-varying vec3 vcolor;
-uniform sampler2D tex;
-uniform float disc;
-void main() {
-  vec4 photo = texture2D(tex, vuv);
-  vec3 color = mix(photo.rgb, vcolor, 0.35);
-  float mask = 1.0;
-  if (disc > 0.5) {
-    float d = distance(vuv, vec2(0.5, 0.5));
-    mask = smoothstep(0.5, 0.42, d);
-  }
-  gl_FragColor = vec4(color, photo.a * mask);
-}`;
-
-/** Blend two rgb colors, t = 0 returns a, t = 1 returns b. */
-function mix(a, b, t) {
-  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-}
-
-/**
- * Texture coordinates for a world box.
- * `scale` is the number of world units one photo tile covers. The uv values may
- * only depend on the world position, never on the camera, otherwise the photo
- * slides over the platform every time the camera moves (for example when the
- * player jumps). World y grows upwards while row 0 of the image is at the top,
- * so v is negated.
- */
-function textureUV(x, y, w, h, scale) {
-  return {
-    u1: x / scale,
-    v1: -y / scale,
-    u2: (x + w) / scale,
-    v2: -(y + h) / scale,
-  };
-}
-
-/**
- * Build the six vertices of one textured quad in clip space:
- * [x, y, u, v] per vertex, two triangles covering the box.
- * The clip positions follow the camera, the uv values follow the world only.
- */
-function texturedQuad(x, y, w, h, cam, view, scale) {
-  const uv = textureUV(x, y, w, h, scale);
-  const x1 = ((x - cam.x) * 2) / view.w;
-  const y1 = ((y - cam.y) * 2) / view.h;
-  const x2 = ((x + w - cam.x) * 2) / view.w;
-  const y2 = ((y + h - cam.y) * 2) / view.h;
-
-  return [
-    [x1, y1, uv.u1, uv.v1],
-    [x2, y1, uv.u2, uv.v1],
-    [x1, y2, uv.u1, uv.v2],
-    [x1, y2, uv.u1, uv.v2],
-    [x2, y1, uv.u2, uv.v1],
-    [x2, y2, uv.u2, uv.v2],
-  ];
-}
 
 /**
  * Create the WebGL renderer for a canvas.
@@ -978,84 +2161,8 @@ function createRenderer(canvas) {
   const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
   if (!gl) throw new Error("WebGL is not available in this browser.");
 
-  const program = buildProgram(gl, VERTEX_SOURCE, FRAGMENT_SOURCE);
-  gl.useProgram(program);
-  const posLoc = gl.getAttribLocation(program, "pos");
-  const colorLoc = gl.getAttribLocation(program, "color");
-  const alphaLoc = gl.getAttribLocation(program, "alpha");
-
-  const texProgram = buildProgram(gl, TEX_VERTEX_SOURCE, TEX_FRAGMENT_SOURCE);
-  const texPosLoc = gl.getAttribLocation(texProgram, "pos");
-  const texUvLoc = gl.getAttribLocation(texProgram, "uv");
-  const texColorLoc = gl.getAttribLocation(texProgram, "color");
-  const texSampler = gl.getUniformLocation(texProgram, "tex");
-  const texDisc = gl.getUniformLocation(texProgram, "disc");
-
-  // Overlapping quads (glow, clouds, the moon) blend instead of hiding each other.
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-  const data = new Float32Array(MAX_QUADS * 6 * FLOATS_PER_VERTEX);
-  const buffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-
-  const texData = new Float32Array(MAX_TEX_QUADS * 6 * TEX_FLOATS_PER_VERTEX);
-  const texBuffer = gl.createBuffer();
-
-  const textures = new Map(); // texture name -> WebGL texture
-  let texName = null; // texture of the batch currently being collected
-  let discMask = false; // the current textured batch is a circular disc
-
-  let quads = 0;
-  let count = 0; // number of floats written into `data`
-  let texQuads = 0;
-  let texCount = 0; // number of floats written into `texData`
-  let drawnQuads = 0; // quads actually sent to the GPU this frame
-
-  /** Upload and draw the flat quads collected so far. */
-  function flushFlat() {
-    if (quads === 0) return;
-
-    gl.useProgram(program);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.bufferData(gl.ARRAY_BUFFER, data.subarray(0, count), gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(posLoc);
-    gl.enableVertexAttribArray(colorLoc);
-    gl.enableVertexAttribArray(alphaLoc);
-    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 0);
-    gl.vertexAttribPointer(colorLoc, 3, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 2 * 4);
-    gl.vertexAttribPointer(alphaLoc, 1, gl.FLOAT, false, FLOATS_PER_VERTEX * 4, 5 * 4);
-    gl.drawArrays(gl.TRIANGLES, 0, quads * 6);
-
-    drawnQuads += quads;
-    quads = 0;
-    count = 0;
-  }
-
-  /** Upload and draw the textured quads that use the same photo. */
-  function flushTex() {
-    if (texQuads === 0) return;
-
-    gl.useProgram(texProgram);
-    gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, texData.subarray(0, texCount), gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(texPosLoc);
-    gl.enableVertexAttribArray(texUvLoc);
-    gl.enableVertexAttribArray(texColorLoc);
-    gl.vertexAttribPointer(texPosLoc, 2, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 0);
-    gl.vertexAttribPointer(texUvLoc, 2, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 2 * 4);
-    gl.vertexAttribPointer(texColorLoc, 3, gl.FLOAT, false, TEX_FLOATS_PER_VERTEX * 4, 4 * 4);
-
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, textures.get(texName));
-    gl.uniform1i(texSampler, 0);
-    gl.uniform1f(texDisc, discMask ? 1 : 0);
-    gl.drawArrays(gl.TRIANGLES, 0, texQuads * 6);
-
-    drawnQuads += texQuads;
-    texQuads = 0;
-    texCount = 0;
-  }
+  const batch = createBatch(gl);
+  const painter = createPainter(batch, canvas);
 
   /** Set the canvas pixel size to its display size times the device scale. */
   function resize(cssWidth, cssHeight, scale) {
@@ -1068,522 +2175,57 @@ function createRenderer(canvas) {
 
   /** Upload the RGBA pixel buffers of the loaded textures to the GPU. */
   function setTextures(list) {
-    for (const item of list) {
-      if (!item.pixels) continue;
-
-      const texture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        item.size,
-        item.size,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        item.pixels
-      );
-      // 512 is a power of two, so tiling with REPEAT is allowed in WebGL 1.
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-
-      textures.set(item.name, texture);
-    }
-    return [...textures.keys()];
-  }
-
-  /** Append 6 vertices (2 triangles) to the flat batch. */
-  function push(x1, y1, x2, y2, cBottom, cTop, alpha = 1) {
-    const corners = [
-      [x1, y1, cBottom, alpha],
-      [x2, y1, cBottom, alpha],
-      [x1, y2, cTop, alpha],
-      [x1, y2, cTop, alpha],
-      [x2, y1, cBottom, alpha],
-      [x2, y2, cTop, alpha],
-    ];
-    for (const c of corners) {
-      data[count++] = c[0];
-      data[count++] = c[1];
-      data[count++] = c[2][0];
-      data[count++] = c[2][1];
-      data[count++] = c[2][2];
-      data[count++] = c[3];
-    }
-    quads += 1;
-  }
-
-  /** Append 6 vertices (2 triangles) to the textured batch. */
-  function pushTexQuad(verts, color) {
-    for (const v of verts) {
-      texData[texCount++] = v[0];
-      texData[texCount++] = v[1];
-      texData[texCount++] = v[2];
-      texData[texCount++] = v[3];
-      texData[texCount++] = color[0];
-      texData[texCount++] = color[1];
-      texData[texCount++] = color[2];
-    }
-    texQuads += 1;
+    return batch.uploadTextures(list);
   }
 
   /**
-   * Draw a box given in world coordinates, using `cam` for the view transform
-   * (a scaled camera is used for parallax layers).
+   * Render one frame of the scene and return the number of quads sent to the
+   * GPU. The drawing order below is the painting order: whatever is drawn last
+   * ends up on top.
    */
-  function rect(x, y, w, h, color, cam, view, topColor, alpha = 1) {
-    if (quads >= MAX_QUADS) return;
-    if (!inView({ x, y, w, h }, cam, view)) return;
-
-    const x1 = ((x - cam.x) * 2) / view.w;
-    const y1 = ((y - cam.y) * 2) / view.h;
-    const x2 = ((x + w - cam.x) * 2) / view.w;
-    const y2 = ((y + h - cam.y) * 2) / view.h;
-    push(x1, y1, x2, y2, color, topColor || color, alpha);
-  }
-
-  /** Draw a box directly in clip space (-1..1) for the fixed sky layer. */
-  function rectClip(x, y, w, h, color, alpha = 1) {
-    if (quads >= MAX_QUADS) return;
-    push(x, y, x + w, y + h, color, color, alpha);
-  }
-
-  /**
-   * Draw a box with a real photo texture. `scale` is the number of world units
-   * one texture tile covers. Returns false when the texture is not loaded, so
-   * the caller can fall back to a flat colour.
-   */
-  function rectTex(x, y, w, h, tint, cam, view, name, scale) {
-    if (!textures.has(name) || quads >= MAX_QUADS) return false;
-    if (!inView({ x, y, w, h }, cam, view)) return false;
-
-    // A batch can only carry one texture, so switch by flushing the old one.
-    if (texQuads >= MAX_TEX_QUADS || (texName !== null && texName !== name)) flushTex();
-    texName = name;
-    discMask = false;
-
-    // The clip positions move with the camera, the uv values stay in world
-    // space, so the photo never slides when the player jumps.
-    pushTexQuad(texturedQuad(x, y, w, h, cam, view, scale), tint);
-    return true;
-  }
-
-  /** Draw one photo-textured circle in clip space with a soft edge. */
-  function discTex(cx, cy, radius, tint, name) {
-    if (!textures.has(name) || texQuads >= MAX_TEX_QUADS) return;
-    if (texQuads > 0 && texName !== name) flushTex();
-
-    texName = name;
-    discMask = true;
-
-    // A square in clip space is stretched on a wide screen, so the height is
-    // multiplied by the aspect ratio to keep the disc round on the display.
-    const aspect = canvas.width / canvas.height;
-    pushTexQuad(
-      [
-        [cx - radius, cy - radius * aspect, 0, 1],
-        [cx + radius, cy - radius * aspect, 1, 1],
-        [cx - radius, cy + radius * aspect, 0, 0],
-        [cx - radius, cy + radius * aspect, 0, 0],
-        [cx + radius, cy - radius * aspect, 1, 1],
-        [cx + radius, cy + radius * aspect, 1, 0],
-      ],
-      tint
-    );
-  }
-
-  /**
-   * Approximate a round circle in clip space with a stack of thin boxes.
-   * A clip-space square is stretched on a wide screen, so the vertical radius
-   * is the horizontal one times the aspect ratio to end up round on display.
-   */
-  function discClip(cx, cy, radius, color, alpha = 1) {
-    if (radius <= 0.01) return;
-    const aspect = canvas.width / canvas.height;
-    const halfY = radius * aspect;
-    const rows = 24;
-    const rowH = (2 * halfY) / rows;
-
-    for (let i = 0; i < rows; i++) {
-      const dy = -halfY + (i + 0.5) * rowH;
-      const t = dy / halfY;
-      const half = radius * Math.sqrt(Math.max(0, 1 - t * t));
-      rectClip(cx - half, cy + dy - rowH / 2, half * 2, rowH, color, alpha);
-    }
-  }
-
-  /** Draw the sky as one full-screen vertical gradient. */
-  function background(topColor, bottomColor) {
-    push(-1, -1, 1, 1, bottomColor, topColor, 1);
-  }
-
-  /**
-   * Draw one city building of the parallax skyline.
-   * `b.y` is the ground line of the lot, the tower is drawn down past the
-   * bottom of the screen so it never looks cut off in mid-air.
-   */
-  function drawBuilding(b, cam, view, near, time) {
-    // Distant buildings are hazier and lighter, the ones in front are darker.
-    const color = near ? [0.16, 0.21, 0.29] : [0.24, 0.31, 0.4];
-    const top = b.y + b.h;
-    const base = belowBottom(cam, view);
-
-    rect(b.x, base, b.w, top - base, color, cam, view);
-    rect(b.x + b.w * 0.08, top, b.w * 0.84, 0.5, mix(color, [1, 1, 1], 0.1), cam, view);
-
-    const cols = Math.max(1, Math.floor(b.w / 1.4));
-    // Rows are counted from the roof downwards; rows below the view are dropped
-    // by the visibility test inside rect(), so they cost nothing.
-    const rows = Math.max(1, Math.min(16, Math.floor((top - base) / 1.7)));
-    const litChance = near ? 0.6 : 0.3;
-
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const seed = hash(b.id * 97 + r, c);
-        // A few windows blink over time so the city looks alive.
-        const blink = seed > 0.88 && Math.floor(time * 1.5 + b.id + r) % 2 === 0;
-        const lit = seed < litChance || blink;
-        const windowColor = lit ? (near ? [0.93, 0.78, 0.38] : [0.62, 0.68, 0.55]) : mix(color, [0, 0, 0], 0.3);
-        rect(b.x + 0.35 + c * 1.4, top - 1.2 - r * 1.7, 0.7, 0.9, windowColor, cam, view);
-      }
-    }
-
-    if (near && hash(b.id, 17) > 0.6) {
-      rect(b.x + b.w * 0.45, top + 0.5, 0.2, 1.8, [0.36, 0.42, 0.5], cam, view);
-    }
-    if (near && hash(b.id, 29) > 0.7) {
-      rect(b.x - 0.6, top - b.h * 0.5, 0.6, 0.5, [0.3, 0.36, 0.44], cam, view); // side tower
-    }
-  }
-
-  /** Draw one platform: a photo body when the texture is loaded, otherwise a
-   * procedural brick or plank pattern. */
-  function drawPlatform(plat, cam, view) {
-    if (plat.kind === "wall") {
-      rect(plat.x, plat.y, plat.w, plat.h, [0.33, 0.36, 0.43], cam, view);
-      for (let cy = 0; cy < Math.floor(plat.h); cy++) {
-        rect(plat.x, plat.y + cy + 0.35, plat.w, 0.12, [0.26, 0.29, 0.35], cam, view);
-      }
-      return;
-    }
-
-    const body = plat.kind === "ground" ? [0.31, 0.4, 0.32] : [0.55, 0.49, 0.42];
-    const top = plat.kind === "ground" ? [0.41, 0.76, 0.44] : [0.86, 0.78, 0.58];
-
-    // The real photo (brick for ground, wood for floating platforms) is drawn
-    // as one textured quad and flushed immediately, so the flat details that
-    // follow always end up on top of it.
-    const photo = rectTex(
-      plat.x,
-      plat.y,
-      plat.w,
-      plat.h,
-      body,
-      cam,
-      view,
-      plat.kind === "ground" ? "brick" : "wood",
-      plat.kind === "ground" ? 3 : 2
-    );
-    flushTex();
-
-    if (photo) {
-      // One thin mortar line keeps the brick photo connected to the game's own
-      // look without hiding the photograph.
-      rect(plat.x, plat.y + plat.h - 0.5, plat.w, 0.1, mix(body, [0, 0, 0], 0.2), cam, view);
-    } else {
-      // Procedural brick texture: mortar lines plus a few bricks in a slightly
-      // different shade.
-      const mortar = mix(body, [0, 0, 0], 0.22);
-      const columns = Math.floor(plat.w);
-      const rows = Math.floor(plat.h);
-
-      for (let cy = 0; cy < rows; cy++) {
-        rect(plat.x, plat.y + cy + 0.9, plat.w, 0.1, mortar, cam, view);
-        const offset = cy % 2 === 0 ? 0 : 0.5;
-        for (let cx = 0; cx <= columns; cx++) {
-          const bx = plat.x + cx + offset;
-          if (bx < plat.x + plat.w - 0.05) rect(bx, plat.y + cy, 0.1, 0.9, mortar, cam, view);
-        }
-        for (let cx = 0; cx < columns; cx++) {
-          if (hash(Math.round(plat.x * 10) + cx, Math.round(plat.y * 10) + cy) < 0.28) {
-            rect(plat.x + cx + offset + 0.1, plat.y + cy + 0.12, 0.8, 0.72, mix(body, [1, 1, 1], 0.07), cam, view);
-          }
-        }
-      }
-    }
-
-    rect(plat.x, plat.top - 0.35, plat.w, 0.35, top, cam, view);
-
-    // Grass blades and small flowers on the walkable surface.
-    if (plat.kind === "ground") {
-      for (let i = 0; i < Math.floor(plat.w * 2); i++) {
-        const gx = plat.x + 0.2 + i * 0.5 + hash(i, Math.round(plat.top * 10)) * 0.25;
-        if (gx > plat.x + plat.w - 0.2) break;
-        const hgt = 0.15 + hash(i, Math.round(plat.y * 10)) * 0.4;
-        rect(gx, plat.top, 0.1, hgt, mix(top, [0.18, 0.44, 0.28], 0.4), cam, view);
-      }
-    }
-  }
-
-  /** Draw scenery: bush, tree, flower, rock or street lamp. */
-  function drawDecor(d, cam, view) {
-    if (d.type === "bush") {
-      rect(d.x, d.y, d.w, d.h, [0.28, 0.58, 0.4], cam, view, [0.4, 0.72, 0.5]);
-      rect(d.x + d.w * 0.18, d.y + d.h * 0.6, d.w * 0.64, d.h * 0.4, [0.43, 0.76, 0.52], cam, view);
-      rect(d.x + d.w * 0.1, d.y + d.h * 0.15, 0.14, 0.14, [0.2, 0.44, 0.33], cam, view);
-      rect(d.x + d.w * 0.6, d.y + d.h * 0.35, 0.14, 0.14, [0.2, 0.44, 0.33], cam, view);
-    } else if (d.type === "tree") {
-      rect(d.x, d.y, d.w, d.h, [0.38, 0.29, 0.22], cam, view);
-      rect(d.x - d.w * 0.6, d.y + d.h * 0.55, d.w * 2.2, d.h * 0.45, [0.33, 0.6, 0.43], cam, view);
-      rect(d.x - d.w * 0.3, d.y + d.h * 0.7, d.w * 1.2, d.h * 0.25, [0.45, 0.72, 0.52], cam, view);
-      rect(d.x - d.w * 0.5, d.y + d.h * 0.6, 0.16, 0.16, [0.22, 0.45, 0.35], cam, view);
-    } else if (d.type === "flower") {
-      rect(d.x + d.w * 0.4, d.y, d.w * 0.2, d.h, [0.3, 0.55, 0.4], cam, view);
-      rect(d.x, d.y + d.h * 0.55, d.w, d.h * 0.45, [0.86, 0.5, 0.6], cam, view, [0.95, 0.66, 0.72]);
-      rect(d.x + d.w * 0.35, d.y + d.h * 0.7, d.w * 0.3, d.h * 0.2, [0.98, 0.86, 0.4], cam, view);
-    } else if (d.type === "rock") {
-      rect(d.x, d.y, d.w, d.h, [0.49, 0.51, 0.55], cam, view, [0.58, 0.6, 0.64]);
-      rect(d.x + d.w * 0.2, d.y + d.h * 0.3, d.w * 0.3, d.h * 0.3, [0.42, 0.44, 0.48], cam, view);
-    } else if (d.type === "lamp") {
-      rect(d.x, d.y, 0.16, d.h, [0.3, 0.33, 0.38], cam, view);
-      rect(d.x - 0.3, d.y + d.h - 0.5, 0.76, 0.5, [0.95, 0.85, 0.45], cam, view, [1, 0.95, 0.65]);
-      rect(d.x - 0.5, d.y + d.h - 0.9, 1.16, 0.4, [0.62, 0.56, 0.4], cam, view);
-    }
-  }
-
-  /** Approximate a filled disc with a stack of thin rectangles. */
-  function disc(cx, cy, r, color, cam, view) {
-    if (r <= 0.05) return;
-    const rows = 9;
-    const rowH = (2 * r) / rows;
-
-    for (let i = 0; i < rows; i++) {
-      const dy = -r + (i + 0.5) * rowH;
-      const half = r * Math.sqrt(Math.max(0, 1 - (dy / r) * (dy / r)));
-      rect(cx - half, cy + dy - rowH / 2, half * 2, rowH, color, cam, view);
-    }
-  }
-
-  /** Draw a jet fighter crossing the sky, nose pointed in its travel direction. */
-  function drawJet(jet, cam, view, time) {
-    const body = [0.8, 0.84, 0.9];
-    const dark = [0.44, 0.49, 0.57];
-    const front = jet.dir > 0 ? jet.x + jet.w : jet.x;
-    const back = jet.dir > 0 ? jet.x : jet.x + jet.w;
-
-    // Exhaust trail behind the aircraft.
-    const trail = 3 + 2 * Math.abs(Math.sin(time * 3 + jet.id));
-    rect(jet.dir > 0 ? back - trail : back, jet.y + jet.h * 0.35, trail, 0.22, [0.55, 0.62, 0.7], cam, view);
-
-    // Fuselage, nose cone, wing and tail fin.
-    rect(jet.x, jet.y, jet.w, jet.h, body, cam, view, mix(body, [1, 1, 1], 0.12));
-    rect(jet.dir > 0 ? front : front - 0.8, jet.y + jet.h * 0.3, 0.8, jet.h * 0.4, body, cam, view);
-    rect(jet.x + jet.w * 0.2, jet.y - 0.55, jet.w * 0.55, 0.55, dark, cam, view);
-    rect(jet.dir > 0 ? back : back - 0.5, jet.y + jet.h, 0.5, 0.75, dark, cam, view);
-    rect(jet.x + jet.w * 0.6, jet.y + jet.h * 0.5, jet.w * 0.22, 0.32, [0.2, 0.26, 0.34], cam, view);
-
-    // Flickering engine flame at the rear.
-    const flame = 0.5 + 0.4 * Math.abs(Math.sin(time * 12 + jet.id));
-    rect(jet.dir > 0 ? back - flame : back, jet.y + jet.h * 0.3, flame, jet.h * 0.4, [0.95, 0.62, 0.3], cam, view);
-  }
-
-  /** Draw a falling bomb, its dashed drop line and the blinking ground marker. */
-  function drawBomb(bomb, cam, view, time) {
-    // Every other frame the warning flashes, so the player sees it clearly.
-    const blink = Math.floor(time * 8) % 2 === 0;
-
-    if (bomb.targetY !== null) {
-      // Dashed line showing exactly where the bomb will land.
-      const lineColor = blink ? [0.95, 0.45, 0.35] : [0.6, 0.3, 0.28];
-      for (let y = bomb.targetY; y < bomb.y; y += 0.8) {
-        rect(bomb.x - 0.07, y, 0.14, 0.4, lineColor, cam, view);
-      }
-
-      // Danger marker on the ground: a wide bar with a bright core above it.
-      rect(bomb.x - 1.1, bomb.targetY, 2.2, 0.22, blink ? [0.92, 0.36, 0.3] : [0.66, 0.26, 0.24], cam, view);
-      rect(bomb.x - 0.4, bomb.targetY + 0.22, 0.8, 0.3, blink ? [1, 0.55, 0.4] : [0.8, 0.4, 0.35], cam, view);
-    }
-
-    // The bomb itself: dark body, fins, blinking fuse light.
-    rect(bomb.x - bomb.w / 2, bomb.y, bomb.w, bomb.h, [0.32, 0.34, 0.39], cam, view, [0.5, 0.52, 0.58]);
-    rect(bomb.x - 0.28, bomb.y + bomb.h, 0.56, 0.28, [0.45, 0.47, 0.52], cam, view);
-    rect(bomb.x - 0.1, bomb.y + bomb.h + 0.28, 0.2, 0.28, blink ? [1, 0.7, 0.3] : [0.5, 0.35, 0.2], cam, view);
-  }
-
-  /** Draw an explosion: a growing fireball with a bright core and dark smoke. */
-  function drawBlast(blast, cam, view, time) {
-    const age = Math.min(1, (time - blast.start) / (blast.duration || BLAST_DURATION));
-    const r = blast.radius * (0.4 + 0.6 * age);
-    const center = blast.y + r * 0.6;
-
-    // Scorch mark on the solid ground the bomb hit.
-    rect(blast.x - r, blast.y, r * 2, 0.18, [0.2, 0.22, 0.26], cam, view);
-
-    disc(blast.x, center, r, [0.35, 0.33, 0.32], cam, view); // smoke
-    disc(blast.x, center, r * 0.72, [0.92, 0.45, 0.22], cam, view); // flame
-    disc(blast.x, center, r * 0.4, [1, 0.9, 0.55], cam, view); // hot core
-
-    // Fragments flung sideways; hash keeps them scattered but stable.
-    for (let i = 0; i < 6; i++) {
-      const spread = r * (0.6 + hash(Math.round(blast.x * 10), i) * 0.8);
-      rect(blast.x + spread, center + age * 1.2, 0.25, 0.25, [0.35, 0.33, 0.32], cam, view);
-      rect(blast.x - spread, center + age * 1.5, 0.25, 0.25, [0.35, 0.33, 0.32], cam, view);
-    }
-  }
-
-  /** Draw the moon: a soft halo and the photo disc on its arc across the sky. */
-  function drawMoon(time) {
-    const moon = moonPosition(time);
-    const tint = moonTint(moon.altitude);
-
-    // The halo is a big half-transparent disc, so the moon lights the sky.
-    discClip(moon.x, moon.y, MOON_RADIUS * 1.9, mix(tint, [1, 1, 1], 0.3), 0.16 + 0.1 * moon.altitude);
-
-    if (textures.has("moon")) {
-      discTex(moon.x, moon.y, MOON_RADIUS, tint, "moon");
-    } else {
-      discClip(moon.x, moon.y, MOON_RADIUS, tint);
-    }
-  }
-
-  /** Render one frame of the scene. */
   function draw(scene) {
-    quads = 0;
-    count = 0;
-    texQuads = 0;
-    texCount = 0;
-    texName = null;
-    drawnQuads = 0;
-    const { cam, view, world, player, enemies, threats, time, moonTime } = scene;
+    const { cam, view, world, player, enemies, threats, time } = scene;
+    const moonTime = scene.moonTime === undefined ? time : scene.moonTime;
 
+    painter.beginFrame(view);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    background([0.09, 0.14, 0.26], [0.6, 0.76, 0.84]);
+    // Fixed sky: gradient, stars and the moon. The moon is drawn before the
+    // city so the skyline can hide it while it rises and sets.
+    drawSky(painter);
+    drawMoon(painter, moonTime);
+    painter.flushFlat();
+    painter.flushTextures();
 
-    // Fixed sky layer: the stars never move with the camera.
-    for (let i = 0; i < 42; i++) {
-      const sx = -1 + (i * 0.049) % 2;
-      const sy = 0.06 + ((i * 0.137) % 0.85);
-      rectClip(sx, sy, 0.006, 0.006, [0.85, 0.9, 0.95]);
-    }
-
-    // The moon is drawn before the city, so the skyline can hide it while it
-    // rises and sets.
-    drawMoon(moonTime === undefined ? time : moonTime);
-    flushFlat();
-    flushTex();
-
-    // Slow drifting clouds: thin haze strips with a lighter core.
-    for (let i = 0; i < 6; i++) {
-      const cx = ((i * 0.42 + time * 0.012) % 2.4) - 1.2;
-      const cy = 0.16 + ((i * 0.31) % 0.62);
-      rectClip(cx, cy, 0.42, 0.035, [0.4, 0.5, 0.6], 0.55);
-      rectClip(cx + 0.08, cy + 0.035, 0.24, 0.03, [0.45, 0.55, 0.65], 0.55);
-      rectClip(cx + 0.05, cy - 0.02, 0.14, 0.02, [0.38, 0.47, 0.57], 0.55);
-    }
-
-    // Far city skyline and distant hills (slow parallax).
-    const farCam = { x: cam.x * 0.22, y: cam.y * 0.12 };
-    const farBase = belowBottom(farCam, view);
-    for (const b of world.buildings) {
-      if (b.layer === 0) drawBuilding(b, farCam, view, false, time);
-    }
-    for (const hill of world.hills) {
-      rect(hill.x, farBase, hill.w, hill.y + hill.h * 0.5 - farBase, [0.2, 0.28, 0.36], farCam, view);
-    }
-
-    // Nearer city layer (faster parallax than the far one).
-    const midCam = { x: cam.x * 0.48, y: cam.y * 0.28 };
-    for (const b of world.buildings) {
-      if (b.layer === 1) drawBuilding(b, midCam, view, true, time);
-    }
+    // Background layers, each moved by its own slow camera.
+    drawClouds(painter, time);
+    drawFarLayer(painter, world, cam, time);
+    drawNearLayer(painter, world, cam, time);
 
     // The skyline sits behind the level, so it must reach the GPU first.
-    flushFlat();
+    painter.flushFlat();
 
-    // Platforms with texture.
-    for (const plat of world.platforms) drawPlatform(plat, cam, view);
+    for (const platform of world.platforms) drawPlatform(painter, platform, cam);
+    for (const decor of world.decor) drawDecor(painter, decor, cam);
 
-    // Scenery on the platforms.
-    for (const d of world.decor) drawDecor(d, cam, view);
-
-    // Patrolling enemies: purple blocks with eyes and animated legs.
-    for (const e of enemies) {
-      if (!inView({ x: e.x, y: e.y, w: e.w, h: e.h }, cam, view)) continue;
-      const h = e.h * (1 - e.squash * 0.7);
-      rect(e.x, e.y, e.w, h, [0.52, 0.31, 0.66], cam, view, [0.71, 0.45, 0.82]);
-
-      if (e.squash < 0.9) {
-        const eyeY = e.y + h * 0.45;
-        const eyeX = e.dir > 0 ? e.x + e.w - 0.45 : e.x + 0.15;
-        rect(eyeX, eyeY, 0.3, 0.3, [0.98, 0.96, 0.9], cam, view);
-        rect(eyeX + 0.12, eyeY + 0.12, 0.14, 0.14, [0.1, 0.1, 0.12], cam, view);
-
-        const leg = 0.25 * Math.abs(Math.sin(time * 6 + e.x));
-        rect(e.x + 0.1, e.y - leg * 0.5, 0.25, 0.2, [0.34, 0.2, 0.44], cam, view);
-        rect(e.x + e.w - 0.35, e.y - leg * 0.4, 0.25, 0.2, [0.34, 0.2, 0.44], cam, view);
-      }
+    for (const enemy of enemies) {
+      if (painter.isVisible(enemy, cam)) drawEnemy(painter, enemy, cam, time);
     }
-
-    // The player character.
-    if (player) {
-      const p = player;
-      rect(p.x, p.y, p.w, p.h, [0.92, 0.47, 0.33], cam, view, [0.99, 0.55, 0.42]);
-      rect(p.x + 0.05, p.y + p.h - 0.45, p.w - 0.1, 0.45, [0.23, 0.55, 0.86], cam, view);
-      rect(p.x + 0.05, p.y + p.h - 0.45, p.w - 0.1, 0.12, [0.3, 0.68, 0.95], cam, view);
-
-      const eyeX = p.face > 0 ? p.x + 0.12 : p.x + p.w - 0.42;
-      rect(eyeX, p.y + p.h - 0.95, 0.3, 0.32, [0.98, 0.97, 0.93], cam, view);
-      rect(eyeX + 0.12, p.y + p.h - 0.85, 0.13, 0.16, [0.12, 0.14, 0.18], cam, view);
-
-      const swing = Math.abs(Math.sin(time * 9)) * 0.28;
-      rect(p.x + 0.1, p.y - (p.onGround ? swing : 0.1), 0.25, 0.28, [0.7, 0.33, 0.25], cam, view);
-      rect(p.x + p.w - 0.35, p.y - (p.onGround ? 0.28 - swing : 0.1), 0.25, 0.28, [0.7, 0.33, 0.25], cam, view);
-      rect(p.x - 0.2, p.y + p.h * 0.4, 0.2, 0.45, [0.85, 0.4, 0.3], cam, view);
-      rect(p.x + p.w, p.y + p.h * 0.4, 0.2, 0.45, [0.85, 0.4, 0.3], cam, view);
-    }
+    if (player) drawPlayer(painter, player, cam, time);
 
     // Jets, falling bombs and explosions are drawn last so they sit on top of
     // the level and stay readable against the sky.
     if (threats) {
-      for (const jet of threats.jets) drawJet(jet, cam, view, time);
-      for (const bomb of threats.bombs) drawBomb(bomb, cam, view, time);
-      for (const blast of threats.blasts) drawBlast(blast, cam, view, time);
+      for (const jet of threats.jets) drawJet(painter, jet, cam, time);
+      for (const bomb of threats.bombs) drawBomb(painter, bomb, cam, time);
+      for (const blast of threats.blasts) drawBlast(painter, blast, cam, time);
     }
 
-    flushFlat();
-    return drawnQuads;
+    painter.flushFlat();
+    return painter.drawnQuads();
   }
 
   return { resize, draw, setTextures, gl };
-}
-
-/** Compile and link one vertex + fragment shader pair into a program. */
-function buildProgram(gl, vertexSource, fragmentSource) {
-  const program = gl.createProgram();
-  const sources = [
-    [vertexSource, gl.VERTEX_SHADER],
-    [fragmentSource, gl.FRAGMENT_SHADER],
-  ];
-
-  for (const [source, type] of sources) {
-    const shader = gl.createShader(type);
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-      throw new Error("Shader compile error: " + gl.getShaderInfoLog(shader));
-    }
-    gl.attachShader(program, shader);
-  }
-
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error("Shader link error: " + gl.getProgramInfoLog(program));
-  }
-  return program;
 }
 
 /* ---- src/textures.js ---- */

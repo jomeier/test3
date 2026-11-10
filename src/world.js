@@ -56,11 +56,15 @@ const HILL_BASE_DROP = 10; // their base stays below the platform top
 const HILL_WIDTH = [10, 26];
 const HILL_HEIGHT = [5, 12];
 
-// Background city: layer 0 is the far skyline (generated almost every chunk so
-// it reads as one continuous city), layer 1 is the nearer and sparser one.
+// Background city: SKYLINE_FAR_LAYER is the far skyline (generated almost every
+// chunk so it reads as one continuous city), SKYLINE_NEAR_LAYER the nearer and
+// sparser one. The renderer picks its buildings by these numbers.
+export const SKYLINE_FAR_LAYER = 0;
+export const SKYLINE_NEAR_LAYER = 1;
+
 const CITY_LAYERS = [
-  { layer: 0, chance: 0.9, back: [2, 14], baseDrop: 12, width: [5, 16], height: [6, 20] },
-  { layer: 1, chance: 0.6, back: [1, 9], baseDrop: 8, width: [4, 11], height: [3, 12] },
+  { layer: SKYLINE_FAR_LAYER, chance: 0.9, back: [2, 14], baseDrop: 12, width: [5, 16], height: [6, 20] },
+  { layer: SKYLINE_NEAR_LAYER, chance: 0.6, back: [1, 9], baseDrop: 8, width: [4, 11], height: [3, 12] },
 ];
 
 // Falling out of the level must end the run, but the line has to follow the
