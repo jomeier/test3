@@ -2,11 +2,11 @@
 
 Decisions about how the code is organised, with the reason for each.
 
-- Raw WebGL 1 and one shared program are used instead of a game engine or a
-  rendering library.
-  *Why:* the project must run with only JavaScript and the browser, and a
-  quad-based scene needs no textures, lighting or 3D math. Fewer dependencies
-  mean fewer things that can break.
+- Raw WebGL 1 and two hand-built programs are used instead of a game engine or
+  a rendering library.
+  *Why:* the project must run with only JavaScript and the browser; a
+  quad-based scene needs no lighting, no 3D math and no asset pipeline, so
+  fewer dependencies mean fewer things that can break.
 
 - Every visible box is batched into one Float32Array and drawn with a single
   `gl.drawArrays` call per program: one flat program and one textured program,
