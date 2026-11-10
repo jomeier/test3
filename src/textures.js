@@ -61,7 +61,7 @@ const JOINT_SHADOW = 0.8; // how much darker the face right next to a joint is
 const BRICK_HUE_SHIFT = 0.10; // warmer or cooler red, share of the colour
 const MORTAR_LIGHT_SHIFT = 0.16; // lighter or darker mortar joints
 const MATERIAL_TONE_SHIFT = 0.22; // brighter or darker whole material
-const HEAD_WARP_FACTOR = 0.024; // waviness of the vertical joints (tile share)
+const HEAD_WARP_FACTOR = 0.008; // waviness of the vertical joints (tile share)
 const GRAIN_WARP_FACTOR = 0.02; // waviness of the wood grain (tile share)
 
 // Noise lattice sizes: bigger counts are finer detail. All fields wrap at the
@@ -138,12 +138,13 @@ function brickPixels(size, seed) {
   const mortar = Math.max(1, Math.round(size * MORTAR_FACTOR));
 
   // One wobble value per row: all head joints of a row shift equally, which
-  // keeps the brick spacing exact while the lines still wave from row to row.
+  // keeps the brick spacing exact while the lines still drift gently from row
+  // to row. Two octaves only, so the drift stays long and straight-looking.
   const headShift = new Float32Array(size);
   for (let y = 0; y < size; y++) {
     headShift[y] = warpOffset(seed, size, 0, y, feel.warp * size, {
       cells: JOINT_WARP_CELLS,
-      octaves: 3,
+      octaves: 2,
       salt: 5,
     });
   }
