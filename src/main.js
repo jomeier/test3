@@ -8,7 +8,7 @@ import { createPlayer, stepPlayer, stepEnemy, playerEnemyCollision } from "./phy
 import { createCamera, computeView, followCamera, CAMERA_LEAD_X, CAMERA_LEAD_Y, START_CAMERA_LEAD_X } from "./camera.js";
 import { createRenderer } from "./renderer.js";
 import { createThreats, stepThreats } from "./jets.js";
-import { loadTextures } from "./textures.js";
+import { loadTextures, levelMaterialPixels } from "./textures.js";
 import { findHudElements, updateHud, showOverlay, reportTextures } from "./hud.js";
 import { createKeyboard } from "./input.js";
 import { installDebugHooks } from "./debug.js";
@@ -48,12 +48,14 @@ let lastFrame = 0;
 let lastQuads = 0;
 let gameOver = false;
 let textureInfo = []; // name and source of every texture the renderer has
+let currentSeed = START_SEED; // seed of the running run, also paints the materials
 let moonOffset = 0; // lets the checks start the moon arc at a chosen moment
 
 const keyboard = createKeyboard(() => newGame(randomSeed()));
 
 /** Start (or restart) a run with a given seed. */
 function newGame(seed) {
+  currentSeed = seed;
   world = createWorld(seed);
   player = createPlayer(world.spawn.x, world.spawn.y);
   camera = createCamera(world.spawn.x + START_CAMERA_LEAD_X, world.spawn.y + CAMERA_LEAD_Y);
@@ -62,6 +64,25 @@ function newGame(seed) {
   gameOver = false;
   hud.overlay.classList.add("hidden");
   updateHud(hud, run, world, threats);
+  paintWorldMaterials(seed);
+}
+
+/**
+ * Repaint the two level materials from the world seed and hand the new pixel
+ * buffers to the renderer. Every world therefore gets its own brick tone and
+ * its own joint wobble while the tiling stays perfect.
+ */
+function paintWorldMaterials(seed) {
+  const materials = levelMaterialPixels(seed);
+  renderer.setTextures(materials);
+
+  for (const material of materials) {
+    const entry = textureInfo.find((texture) => texture.name === material.name);
+    if (entry) {
+      entry.source = material.source;
+      entry.ok = material.ok;
+    }
+  }
 }
 
 /** Put the player back at the spawn point after a fall or a hit. */
@@ -161,7 +182,7 @@ function loop(now) {
 
 /** Download the photo textures and hand them to the renderer. */
 function loadTextureSet() {
-  loadTextures().then((textures) => {
+  loadTextures(currentSeed).then((textures) => {
     renderer.setTextures(textures);
     textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit, ok: texture.ok }));
     reportTextures(hud, textures);
@@ -214,6 +235,7 @@ installDebugHooks({
     moonOffset = seconds - time;
   },
   textures: () => textureInfo,
+  materialSeed: () => currentSeed,
   run: () => run,
   quads: () => lastQuads,
 });

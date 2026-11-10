@@ -35,6 +35,8 @@ export function installDebugHooks(api) {
     },
     /** Which textures were really downloaded and which use the stand-in. */
     textures: api.textures,
+    /** The seed the current world's materials were generated from. */
+    materialSeed: api.materialSeed,
     /** One platform of the current world, for the pixel checks. */
     platform: (index) => {
       const world = api.world();
@@ -136,6 +138,7 @@ function readState(api) {
     warningDelay: threats ? threats.lastWarningDelay : null,
     bombsDropped: run.bombsDropped,
     textures: api.textures(),
+    materialSeed: api.materialSeed(),
     player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
     quads: api.quads(),
     enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],

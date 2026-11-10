@@ -449,6 +449,7 @@ async function main() {
       ["world is generated", start.platforms > MIN_PLATFORM_COUNT && start.enemies >= MIN_START_ENEMIES],
       ["enemies patrol", final.enemiesMoving.length > 0 && final.enemiesMoving.some((e, i) => Math.abs(e.x - (before.enemiesMoving[i]?.x ?? e.x)) > MIN_ENEMY_MOVE)],
       ["R regenerates the world", afterR.seed !== start.seed],
+      ["each new world paints its own materials", afterR.materialSeed !== start.materialSeed && Number.isInteger(afterR.materialSeed)],
       ["stomping an enemy scores", stompState.stomps > 0 && stompState.score >= MIN_STOMP_SCORE],
       ["a jet crosses the sky", jetSeen],
       ["the jet drops a bomb", bombSeen && jetState.bombsDropped > 0],

@@ -1,5 +1,6 @@
 // Purpose: Write the material texture buffers out as image files so the patterns
-// can be looked at (and tiled) without starting a browser.
+// can be looked at (and tiled) without starting a browser. An optional command
+// line seed paints the materials of one world, e.g. `node tools/dump-textures.mjs 42`.
 
 import { mkdirSync, writeFileSync } from "node:fs";
 
@@ -7,6 +8,7 @@ import { TEXTURE_SIZE, proceduralPixels } from "../src/textures.js";
 
 const OUT_DIR = "/tmp/opencode/tex";
 const NAMES = ["brick", "wood", "moon"];
+const seed = Number(process.argv[2] || 0); // world seed whose materials to dump
 
 /** Write an RGBA buffer as a binary PPM (P6) file that image tools can read. */
 function writePpm(path, pixels, size) {
@@ -43,9 +45,10 @@ function writeTiledPpm(path, pixels, size) {
 
 mkdirSync(OUT_DIR, { recursive: true });
 
+const suffix = seed === 0 ? "" : `-${seed}`;
 for (const name of NAMES) {
-  const pixels = proceduralPixels(name, TEXTURE_SIZE);
-  writePpm(`${OUT_DIR}/${name}.ppm`, pixels, TEXTURE_SIZE);
-  writeTiledPpm(`${OUT_DIR}/${name}-tiled.ppm`, pixels, TEXTURE_SIZE);
-  console.log(`wrote ${OUT_DIR}/${name}.ppm and ${name}-tiled.ppm`);
+  const pixels = proceduralPixels(name, TEXTURE_SIZE, seed);
+  writePpm(`${OUT_DIR}/${name}${suffix}.ppm`, pixels, TEXTURE_SIZE);
+  writeTiledPpm(`${OUT_DIR}/${name}${suffix}-tiled.ppm`, pixels, TEXTURE_SIZE);
+  console.log(`wrote ${OUT_DIR}/${name}${suffix}.ppm and ${name}${suffix}-tiled.ppm (seed ${seed})`);
 }

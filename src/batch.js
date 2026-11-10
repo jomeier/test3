@@ -189,6 +189,11 @@ function uploadTextures(gl, textures, list) {
   for (const item of list) {
     if (!item.pixels) continue;
 
+    // Repainting a material replaces its GPU texture; without deleting the old
+    // one, pressing R many times would leak a texture per material and run.
+    const previous = textures.get(item.name);
+    if (previous) gl.deleteTexture(previous);
+
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, item.size, item.size, 0, gl.RGBA, gl.UNSIGNED_BYTE, item.pixels);

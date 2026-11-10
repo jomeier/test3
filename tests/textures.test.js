@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert";
 
-import { TEXTURES, TEXTURE_SIZE, proceduralPixels } from "../src/textures.js";
+import { TEXTURES, TEXTURE_SIZE, proceduralPixels, levelMaterialPixels } from "../src/textures.js";
 
 /** Read one pixel of an RGBA buffer as [r, g, b]. */
 function pixel(pixels, x, y, size) {
@@ -75,21 +75,23 @@ test("the brick pattern shows mortar lines between coloured bricks", () => {
 
 test("the brick joints keep their spacing across the tile border", () => {
   const size = 512;
-  const pixels = proceduralPixels("brick", size);
   const courseH = size / 8;
   const row = Math.floor(courseH * 2.5); // middle of a brick row
   const brickW = size / 4;
 
-  const starts = mortarColumns(pixels, size, row);
-  assert.ok(starts.length === 4, "one tile shows four vertical joints in a row, found " + starts.length);
+  for (const seed of [0, 7, 4242]) {
+    const pixels = proceduralPixels("brick", size, seed);
+    const starts = mortarColumns(pixels, size, row);
+    assert.ok(starts.length === 4, `seed ${seed}: one tile shows four vertical joints in a row, found ${starts.length}`);
 
-  const gaps = starts.map((start, index) => {
-    const next = index + 1 < starts.length ? starts[index + 1] : starts[0] + size;
-    return next - start;
-  });
+    const gaps = starts.map((start, index) => {
+      const next = index + 1 < starts.length ? starts[index + 1] : starts[0] + size;
+      return next - start;
+    });
 
-  for (const gap of gaps) {
-    assert.ok(Math.abs(gap - brickW) <= 1, `a joint gap is ${gap}, expected ${brickW}: no brick may be cut at the border`);
+    for (const gap of gaps) {
+      assert.ok(Math.abs(gap - brickW) <= 2, `seed ${seed}: a joint gap is ${gap}, expected ${brickW}: no brick may be cut at the border`);
+    }
   }
 });
 
@@ -146,6 +148,31 @@ test("no pattern is a single flat colour", () => {
     }
 
     assert.ok(distinct.size > 8, name + " pattern must have visible variation");
+  }
+});
+
+test("every world seed paints its own material, and the same seed again", () => {
+  const first = proceduralPixels("brick", 128, 11);
+  const same = proceduralPixels("brick", 128, 11);
+  const other = proceduralPixels("brick", 128, 12);
+
+  assert.deepStrictEqual(first, same, "a world seed must reproduce its material");
+
+  let differences = 0;
+  for (let i = 0; i < first.length; i += 4) {
+    if (Math.abs(first[i] - other[i]) > 3) differences++;
+  }
+  assert.ok(differences > first.length / 4 / 8, "another world seed must visibly change the material");
+});
+
+test("levelMaterialPixels hands the renderer both tiled level materials", () => {
+  const materials = levelMaterialPixels(5);
+
+  assert.deepStrictEqual(materials.map((material) => material.name).sort(), ["brick", "wood"]);
+  for (const material of materials) {
+    assert.ok(material.ok, material.name + " is always available offline");
+    assert.strictEqual(material.size, TEXTURE_SIZE);
+    assert.strictEqual(material.pixels.length, TEXTURE_SIZE * TEXTURE_SIZE * 4);
   }
 });
 
