@@ -32,4 +32,6 @@ Index of all learning files. Format per entry:
 
 - [Chrome serves cached ES modules to headless checks](chrome-serves-cached-es-modules-to-headless-checks.md) — Keywords: CDP, Network.setCacheDisabled, module cache, verify-browser, stale build (verified, 2026-11-10)
 
+- [Preview lines in a tiled texture are not always a seam](tiled-preview-lines-are-not-always-seams.md) — Keywords: seam ratio, border luma jump, butt joint, texture preview, tileable (verified, 2026-11-11)
+
 New files start from `_template.md`. Do not list `_template.md` here.
