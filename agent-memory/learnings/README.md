@@ -22,4 +22,6 @@ Index of all learning files. Format per entry:
 
 - [Game time freezes when the run is over](game-time-freezes-on-game-over.md) — Keywords: time, gameOver, moon phase, headless check, setMoonPhase (verified, 2026-11-10)
 
+- [gh repo view --json does not expose REST field names](gh-repo-view-json-field-names.md) — Keywords: gh CLI, GitHub API, json fields, repo metadata (verified, 2026-11-10)
+
 New files start from `_template.md`. Do not list `_template.md` here.
