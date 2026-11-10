@@ -6,7 +6,7 @@ Index of all guideline files. Format per entry:
 
 - [Title](file.md) — Keywords: keyword1, keyword2
 
-- [Architecture](architecture.md) — Keywords: WebGL 1, raw WebGL, shader program, draw call, modules, testing, standalone build
+- [Architecture](architecture.md) — Keywords: WebGL 1, raw WebGL, shader program, draw call, modules, testing, standalone build, painter object, named constants, import cycle
 
 - [Visual style](visual-style.md) — Keywords: flat rectangles, depth, photo textures, texture uv, colors, background towers, look
 

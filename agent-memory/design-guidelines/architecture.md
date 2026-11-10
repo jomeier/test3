@@ -16,9 +16,24 @@ Decisions about how the code is organised, with the reason for each.
   calls would dominate the frame time.
 
 - Game logic lives in small modules (`prng.js`, `world.js`, `physics.js`,
-  `camera.js`, `renderer.js`) and the loop only connects them in `main.js`.
+  `camera.js`, `jets.js`, `moon.js`) and the loop only connects them in
+  `main.js`; the drawing is split the same way (`renderer.js` sets the context
+  and the painting order, `shaders.js`, `batch.js` and `painter.js` build the
+  picture, `drawSky.js`, `drawCity.js`, `drawLevel.js`, `drawActors.js` and
+  `drawThreats.js` own one scene part each).
   *Why:* pure functions (generation, collision, camera math) can be tested in
-  Node without a browser, which is how the tests are able to cover the game.
+  Node without a browser, which is how the tests are able to cover the game,
+  and one topic per file keeps a change in one place.
+
+- The scene modules receive a `painter` object (`rect`, `rectTex`, `disc`,
+  `belowView`, `flushTextures`, ...) and never import `renderer.js`.
+  *Why:* `standalone.html` concatenates the modules into one plain script, and
+  an import cycle back into the renderer would break that bundle.
+
+- Every colour, size, distance and animation speed is a named constant in the
+  module that uses it; `tools/check-constants.mjs` proves each name resolves.
+  *Why:* the value and its reason sit together, and a half-applied rename would
+  only crash in the browser, where no node test can see it.
 
 - The renderer never mutates the world. It only reads `world`, `player` and
   `enemies` and turns them into triangles.
