@@ -2,11 +2,19 @@
 
 Decisions about the look of the game, with the reason for each.
 
-- Everything is built from flat axis-aligned rectangles; the only image files
-  are three photos (moon, brick wall, wood planks) fetched from the web and
-  tinted 35 % toward the object colour.
-  *Why:* the renderer still needs no asset pipeline - the photo only adds
-  detail, the shape and the tint still carry the look.
+- Everything is built from flat axis-aligned rectangles; the only photo is the
+  moon, fetched from the web. The two level materials (brick, planks) are
+  painted into the texture buffer in code and tinted 35 % toward the material
+  colour.
+  *Why:* a real photo of a wall is never tileable - its border does not match
+  its own other side, so every repeat shows a seam and cuts bricks in half. A
+  built pattern whose modules divide the tile is seamless by construction and
+  needs no network.
+
+- Material tiles sit on the block grid: one brick tile covers 4 world units,
+  one plank tile 2, and every joint sits at the top of its course or plank.
+  *Why:* every platform surface is a whole world unit, so a block edge always
+  ends on a joint and the material never looks cut.
 
 - Photo texture uv comes only from world coordinates, never from the camera.
   *Why:* uv built from the clip-space box slides the picture over the platform
