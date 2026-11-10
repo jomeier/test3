@@ -8,17 +8,19 @@ JavaScript and raw WebGL (no libraries, no build step).
 - Jump on an enemy from above to defeat it, touch it from the side and you lose a life.
 - A two-layer city skyline with lit, blinking windows and distant hills moves
   behind the level with a parallax effect.
-- Platforms are textured (grass blades, brick mortar), and bushes, trees,
-  flowers and street lamps decorate them.
+- Ground blocks are brick, floating platforms are wooden planks. Both material
+  pictures are painted into the texture buffer by code, their joints sit on the
+  same grid as the blocks and the picture repeats without any visible seam.
+  Grass blades and occasional flowers line the walkable surface, and bushes,
+  trees, flowers and street lamps decorate the platforms.
 - Jet fighters cross the sky every few seconds and drop a bomb right over the
   player. The bomb hits the solid ground after 1.5 seconds and explodes there;
   the blast kills enemies and costs the player a life.
 - The moon rises on the left in an arc, pauses at the top, and sets on the
   right: 10 s up, 3 s pause, 10 s down, then the cycle starts again.
-- Three real photo textures are downloaded from the internet and used sparingly:
-  the moon disc, the body of ground platforms (brick) and the body of floating
-  platforms (wood). If a download fails, a procedural stand-in pattern is drawn
-  instead, so the game also works offline.
+- The moon is a real photo downloaded from the internet, used for one disc only.
+  If the download fails, a drawn moon pattern is used instead, so the game also
+  works offline. The level materials need no download at all.
 
 ## Run it
 
@@ -57,26 +59,30 @@ node --test tests/*.test.js
 
 Covers the world generator, the physics (gravity, jumping, collision,
 stomping), the camera maths, the moon arc, the jets, bombs and explosions, the
-procedural texture stand-ins, the anchored photo textures, the module graph of
+seamless material patterns, the anchored material textures, the module graph of
 the standalone build and the constant names of every module.
 
-Two extra checks are worth running by hand as well:
+Three extra checks are worth running by hand as well:
 
 ```bash
 node tools/build-standalone.mjs        # rebuild standalone.html
 node tools/check-constants.mjs         # every constant name resolves
+node tools/dump-textures.mjs           # material tiles as image files
 ```
 
 ## Texture credits
 
-| Texture | Photo | License |
+| Texture | Where it comes from | License |
 |---|---|---|
 | Moon | Wikimedia Commons: `Phase-180.jpg` (Jay Tanner) | CC BY-SA 3.0 |
-| Brick | Wikimedia Commons: `Surfaces brick wall with mortar closeup view.JPG` (Tomwsulcer) | CC0 |
-| Wood | Wikimedia Commons: `Wood planks - Preview` (Amal Kumar via Poly Haven) | CC0 |
+| Brick | drawn in code (`src/textures.js`) | - |
+| Wood planks | drawn in code (`src/textures.js`) | - |
 
-The images are fetched at runtime and never stored in the repository. The HUD
-shows which textures were really downloaded.
+The moon photo is fetched at runtime and never stored in the repository. The HUD
+shows which textures were really downloaded. The two level materials are painted
+into the pixel buffer instead of being loaded, because a photo of a real wall is
+never tileable: its border does not match its own other side, so every repeat
+shows a seam and cuts bricks in half.
 
 ## Browser verification
 
@@ -113,7 +119,7 @@ src/painter.js        primitives: boxes, discs, photo boxes, sky gradient
 
 src/drawSky.js        sky gradient, stars, drifting clouds, moon
 src/drawCity.js       parallax skyline with lit windows, background hills
-src/drawLevel.js      platforms (photo or procedural pattern), grass, props
+src/drawLevel.js      platform materials, grass, stone pillar, scenery props
 src/drawActors.js     patrolling enemies and the player
 src/drawThreats.js    jets, falling bombs and explosions
 
@@ -123,6 +129,7 @@ src/debug.js          window.__game hooks used by the browser checks
 
 tools/build-standalone.mjs   bundles src into standalone.html
 tools/check-constants.mjs    finds constant names that resolve nowhere
+tools/dump-textures.mjs      writes the material buffers as image files
 tools/verify-browser.mjs     headless Chrome checks and screenshots
 tests/                       node test suite
 standalone.html              generated single-file version
