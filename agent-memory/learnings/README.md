@@ -30,4 +30,6 @@ Index of all learning files. Format per entry:
 
 - [A module split breaks the standalone bundle twice](module-split-breaks-standalone-bundle.md) — Keywords: standalone build, module graph, duplicate const, script scope, re-export (verified, 2026-11-10)
 
+- [Chrome serves cached ES modules to headless checks](chrome-serves-cached-es-modules-to-headless-checks.md) — Keywords: CDP, Network.setCacheDisabled, module cache, verify-browser, stale build (verified, 2026-11-10)
+
 New files start from `_template.md`. Do not list `_template.md` here.
