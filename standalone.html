@@ -1834,6 +1834,7 @@ function createThreats(seed) {
     jets: [],
     bombs: [],
     blasts: [],
+    lastWarningDelay: null, // game seconds between a drop and its explosion
   };
 }
 
@@ -1925,6 +1926,10 @@ function stepThreats(threats, world, player, dt, time) {
 
     if (bomb.targetY !== null && bomb.y <= bomb.targetY) {
       bomb.y = bomb.targetY;
+      // The warning window the player really got, in game seconds. The
+      // browser checks read this number instead of polling the state,
+      // which is never exact.
+      threats.lastWarningDelay = time - bomb.droppedAt;
       explode(threats, world, player, bomb, time, events);
       bomb.dead = true;
     } else if (bomb.y < world.lowestTop - VOID_MARGIN) {

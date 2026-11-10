@@ -13,6 +13,12 @@ const CHROME = process.env.CHROME || "google-chrome";
 const WIDTH = Number(process.env.WIDTH || 1200);
 const HEIGHT = Number(process.env.HEIGHT || 720);
 
+// The warning window is measured inside the game simulation, because polling
+// the clock from outside the browser run is never exact.
+const BOMB_WARNING_SECONDS = 1.5; // drop -> impact, see BOMB_WARNING in jets.js
+const BOMB_WARNING_TOLERANCE = 0.25; // seconds of slack for the physics step
+const MID_AIR_SAMPLE_DELAY = 0.7; // seconds after the drop for the mid-air shot
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Start a tiny static web server for the project directory. */
@@ -303,14 +309,15 @@ async function main() {
     console.log("stomp test state:", stompState);
 
     // Jets and bombs: force a jet, then follow the drop, the falling bomb and
-    // the blast, and measure the delay between the drop and the explosion.
+    // the blast. The warning window itself is measured inside the simulation
+    // (threats.lastWarningDelay), because polling this clock from the outside
+    // is never exact and made this check fail now and then.
     await cdp.send("Runtime.evaluate", { expression: "window.__game.spawnJet()" });
     let jetSeen = false;
     let bombSeen = false;
     let midAirSeen = false;
     let blastSeen = false;
     let droppedAt = null;
-    let explodedAt = null;
 
     for (let i = 0; i < 120; i++) {
       const s = await state(cdp);
@@ -326,13 +333,12 @@ async function main() {
       }
 
       // Half a second later the bomb is in the middle of its fall.
-      if (bombSeen && !midAirSeen && droppedAt !== null && s.time - droppedAt > 0.7) {
+      if (bombSeen && !midAirSeen && droppedAt !== null && s.time - droppedAt > MID_AIR_SAMPLE_DELAY) {
         midAirSeen = true;
         await shot(cdp, "12-bomb-mid-air");
       }
 
       if (s.blasts > 0 && !blastSeen) {
-        explodedAt = s.time;
         blastSeen = true;
         await shot(cdp, "13-explosion");
         await sleep(250);
@@ -344,7 +350,7 @@ async function main() {
     }
 
     const jetState = await state(cdp);
-    const warningDelay = explodedAt !== null && droppedAt !== null ? explodedAt - droppedAt : null;
+    const warningDelay = jetState.warningDelay;
     console.log("jet test state:", jetState, "warning delay:", warningDelay);
 
     // Moon arc: jump the moon to four moments of its cycle and photograph it,
@@ -423,7 +429,7 @@ async function main() {
       ["a jet crosses the sky", jetSeen],
       ["the jet drops a bomb", bombSeen && jetState.bombsDropped > 0],
       ["the bomb explodes on the ground", blastSeen],
-      ["the blast appears about 1.5 s after the drop", warningDelay !== null && Math.abs(warningDelay - 1.5) < 0.25],
+      [`the blast appears about ${BOMB_WARNING_SECONDS} s after the drop`, warningDelay !== null && Math.abs(warningDelay - BOMB_WARNING_SECONDS) < BOMB_WARNING_TOLERANCE],
       ["the moon rises, pauses at the top and sets", Boolean(moonMoments.rising && moonMoments.top && moonMoments.setting)],
       ["the moon arc runs from the left to the right", moonMoments.rising.x < moonMoments.top.x && moonMoments.top.x < moonMoments.setting.x],
       ["the moon is highest in the middle of the sky", moonMoments.top.y > 0.5 && moonMoments.top.y > moonMoments.rising.y && moonMoments.top.y > moonMoments.setting.y],

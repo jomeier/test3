@@ -143,6 +143,10 @@ test("the bomb reaches the ground exactly BOMB_WARNING seconds after the drop", 
 
   const delay = marks.blasts[0] - marks.drops[0];
   assert.ok(Math.abs(delay - BOMB_WARNING) < 0.02, `impact took ${delay}s, expected ~${BOMB_WARNING}s`);
+  assert.ok(
+    Math.abs(threats.lastWarningDelay - BOMB_WARNING) < 0.02,
+    "the threats state records the same warning delay the simulation measured"
+  );
 });
 
 test("the bomb explodes on the highest solid surface below it", () => {

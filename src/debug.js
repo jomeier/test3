@@ -131,6 +131,9 @@ function readState(api) {
     jets: threats ? threats.jets.length : 0,
     bombsInAir: threats ? threats.bombs.length : 0,
     blasts: threats ? threats.blasts.length : 0,
+    // Game seconds between the last drop and its explosion. Measured inside the
+    // simulation, so the browser check does not have to poll this clock.
+    warningDelay: threats ? threats.lastWarningDelay : null,
     bombsDropped: run.bombsDropped,
     textures: api.textures(),
     player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
