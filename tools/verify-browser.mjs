@@ -13,11 +13,30 @@ const CHROME = process.env.CHROME || "google-chrome";
 const WIDTH = Number(process.env.WIDTH || 1200);
 const HEIGHT = Number(process.env.HEIGHT || 720);
 
-// The warning window is measured inside the game simulation, because polling
-// the clock from outside the browser run is never exact.
+// Tolerances of the checks. A headless run is slower and less exact than a
+// desktop one, so every threshold is wider than the value the game guarantees.
+const MIN_DRAWN_QUADS = 40; // a frame must send more than this many boxes
+const MIN_PLATFORM_COUNT = 10; // the first world is generated up to x = 120
+const MIN_START_ENEMIES = 1; // and must contain at least one patrolling enemy
+const MIN_ENEMY_MOVE = 0.1; // world units: proof that an enemy really walks
+const MIN_STOMP_SCORE = 100; // points for one stomp, see STOMP_SCORE in main.js
+const PHOTO_TEXTURE_COUNT = 2; // moon, brick and wood are fetched from the web
+const MIN_PLATFORM_SHADES = 20; // distinct colours in one sampled platform
+const MAX_TEXTURE_SHIFT = 2; // px: an anchored texture may not slide further
+const MAX_ANCHOR_DIFF = 0.05; // mean pixel difference at that best shift
+const MAX_PIXEL_SEARCH_SHIFT = 24; // px range the best-shift search scans
+const MOON_HIGH_Y = 0.5; // clip space height of a moon near the top of the sky
 const BOMB_WARNING_SECONDS = 1.5; // drop -> impact, see BOMB_WARNING in jets.js
-const BOMB_WARNING_TOLERANCE = 0.25; // seconds of slack for the physics step
+const BOMB_WARNING_TOLERANCE = 0.25; // seconds of slack for the headless clock
 const MID_AIR_SAMPLE_DELAY = 0.7; // seconds after the drop for the mid-air shot
+
+// Area of one platform that is read back from the canvas for the texture
+// anchor test. It sits away from every edge, so a partly covered strip can
+// never make a sliding texture look correct.
+const SAMPLE_INSET_X = 1; // world units in from the left edge of the platform
+const SAMPLE_INSET_Y = 0.4; // world units above the bottom of the platform
+const SAMPLE_WIDTH = 4; // world units of the sampled strip
+const SAMPLE_HEIGHT = 1.4; // stays inside the body, clear of the surface
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -161,7 +180,7 @@ function pixelDifference(a, b) {
  * noise; a texture that slides with the camera needs a large shift and still
  * leaves a big residual.
  */
-function bestShift(a, b, pw, ph, maxShift = 24) {
+function bestShift(a, b, pw, ph, maxShift = MAX_PIXEL_SEARCH_SHIFT) {
   let best = { dx: 0, dy: 0, diff: pixelDifference(a, b) };
 
   for (let dy = -maxShift; dy <= maxShift; dy++) {
@@ -230,7 +249,7 @@ async function main() {
         })
       ).result.value
     );
-    const region = [plat.x + 1, plat.y + 0.4, 4, 1.4];
+    const region = [plat.x + SAMPLE_INSET_X, plat.y + SAMPLE_INSET_Y, SAMPLE_WIDTH, SAMPLE_HEIGHT];
 
     const standing = await readRect(cdp, ...region);
     await pressKey(cdp, " ", "Space", 250);
@@ -418,26 +437,26 @@ async function main() {
 
     const checks = [
       ["canvas fills the window", canvasInfo.w === canvasInfo.iw && canvasInfo.h === canvasInfo.ih],
-      ["WebGL draws geometry", start.quads > 40],
+      ["WebGL draws geometry", start.quads > MIN_DRAWN_QUADS],
       ["player stands on a platform", start.player && start.player.onGround],
       ["the player is inside the camera view", onScreen.onScreen],
       ["player can move", final.farthest > 0],
-      ["world is generated", start.platforms > 10 && start.enemies > 0],
-      ["enemies patrol", final.enemiesMoving.length > 0 && final.enemiesMoving.some((e, i) => Math.abs(e.x - (before.enemiesMoving[i]?.x ?? e.x)) > 0.1)],
+      ["world is generated", start.platforms > MIN_PLATFORM_COUNT && start.enemies >= MIN_START_ENEMIES],
+      ["enemies patrol", final.enemiesMoving.length > 0 && final.enemiesMoving.some((e, i) => Math.abs(e.x - (before.enemiesMoving[i]?.x ?? e.x)) > MIN_ENEMY_MOVE)],
       ["R regenerates the world", afterR.seed !== start.seed],
-      ["stomping an enemy scores", stompState.stomps > 0 && stompState.score >= 100],
+      ["stomping an enemy scores", stompState.stomps > 0 && stompState.score >= MIN_STOMP_SCORE],
       ["a jet crosses the sky", jetSeen],
       ["the jet drops a bomb", bombSeen && jetState.bombsDropped > 0],
       ["the bomb explodes on the ground", blastSeen],
       [`the blast appears about ${BOMB_WARNING_SECONDS} s after the drop`, warningDelay !== null && Math.abs(warningDelay - BOMB_WARNING_SECONDS) < BOMB_WARNING_TOLERANCE],
       ["the moon rises, pauses at the top and sets", Boolean(moonMoments.rising && moonMoments.top && moonMoments.setting)],
       ["the moon arc runs from the left to the right", moonMoments.rising.x < moonMoments.top.x && moonMoments.top.x < moonMoments.setting.x],
-      ["the moon is highest in the middle of the sky", moonMoments.top.y > 0.5 && moonMoments.top.y > moonMoments.rising.y && moonMoments.top.y > moonMoments.setting.y],
-      ["photo textures are downloaded from the internet", textures.length >= 2 && textures.filter((t) => t.source === "internet").length >= 2],
-      ["the sampled platform shows photo detail", detail > 20],
-      ["the platform texture does not slide while jumping", Math.abs(jumpShift.dx) <= 2 && Math.abs(jumpShift.dy) <= 2 && jumpShift.diff < 0.05],
-      ["the platform texture does not slide while running", Math.abs(runShift.dx) <= 2 && Math.abs(runShift.dy) <= 2 && runShift.diff < 0.05],
-      ["the texture is back in place after landing", Math.abs(landingShift.dx) <= 2 && Math.abs(landingShift.dy) <= 2 && landingShift.diff < 0.05],
+      ["the moon is highest in the middle of the sky", moonMoments.top.y > MOON_HIGH_Y && moonMoments.top.y > moonMoments.rising.y && moonMoments.top.y > moonMoments.setting.y],
+      ["photo textures are downloaded from the internet", textures.length >= PHOTO_TEXTURE_COUNT && textures.filter((t) => t.source === "internet").length >= PHOTO_TEXTURE_COUNT],
+      ["the sampled platform shows photo detail", detail > MIN_PLATFORM_SHADES],
+      ["the platform texture does not slide while jumping", Math.abs(jumpShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(jumpShift.dy) <= MAX_TEXTURE_SHIFT && jumpShift.diff < MAX_ANCHOR_DIFF],
+      ["the platform texture does not slide while running", Math.abs(runShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(runShift.dy) <= MAX_TEXTURE_SHIFT && runShift.diff < MAX_ANCHOR_DIFF],
+      ["the texture is back in place after landing", Math.abs(landingShift.dx) <= MAX_TEXTURE_SHIFT && Math.abs(landingShift.dy) <= MAX_TEXTURE_SHIFT && landingShift.diff < MAX_ANCHOR_DIFF],
       ["no console errors", cdp.consoleLines().length === 0],
     ];
 
