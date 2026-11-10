@@ -3,10 +3,14 @@
 // procedural detail (grass, mortar lines, windows, bushes) and draw the few
 // real photo textures (moon, brick, wood) that src/textures.js loads.
 
-import { inView } from "./camera.js";
+import { inView, belowBottom, OFFSCREEN_MARGIN } from "./camera.js";
 import { hash } from "./prng.js";
 import { BLAST_DURATION } from "./jets.js";
 import { MOON_RADIUS, moonPosition, moonTint } from "./moon.js";
+
+// belowBottom owns the skyline base line. It stays reachable from this module
+// because that is where the tests and the design notes look for it.
+export { belowBottom };
 
 const MAX_QUADS = 15000;
 const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
@@ -68,15 +72,6 @@ void main() {
 /** Blend two rgb colors, t = 0 returns a, t = 1 returns b. */
 function mix(a, b, t) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-}
-
-/**
- * A world y far below the bottom edge of the current view.
- * Background layers use it as their ground line so the towers and hills always
- * run off the bottom of the screen instead of ending in mid-air.
- */
-export function belowBottom(cam, view, margin = 40) {
-  return cam.y - view.h / 2 - margin;
 }
 
 /**

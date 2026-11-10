@@ -176,13 +176,72 @@ function hash(a, b) {
 /* ---- src/world.js ---- */
 // Purpose: Generate the jump-and-run world procedurally in chunks (platforms,
 // patrolling enemies, scenery and a parallax city skyline) so the level grows
-// endlessly to the right and is reproducible from a seed.
+// endlessly to the right and is reproducible from one seed.
+// Every generation value is a named constant here; the reason for each value is
+// written down in agent-memory/design-guidelines/world-generation.md.
+// Pure data in, data out, so the generator is testable without a browser.
 
 
 
+// Shape of the level. Tests import the first three.
 const MIN_PLATFORM_WIDTH = 3.2;
-const MAX_GAP = 3.4;
-const START_TOP = 2;
+const MAX_GAP = 3.4; // gap before a flat step or a drop
+const START_TOP = 2; // walkable surface of the first platform
+const MAX_PLATFORM_WIDTH = 9;
+const MIN_GAP = 1.2;
+const MAX_GAP_BEFORE_CLIMB = 2.4; // climbing is harder than jumping across
+const MIN_TOP = -6; // clamped so the level never drifts out of view
+const MAX_TOP = 18;
+const RISE_CHANCE = 0.45; // most steps go up, drops are the exception
+const MAX_RISE = 2; // a small upward step is always reachable
+const MAX_DROP = 3; // a bigger drop gives the player room to fall
+const GROUND_CHANCE = 0.55; // ground is the dominant kind
+const GROUND_HEIGHT = 3; // thick, green, walkable
+const FLOAT_HEIGHT = 1; // thin, warm planks, reads as a light platform
+
+// The first chunk is placed by hand: a wide safe strip to land on and a tall
+// pillar on the left edge that stops the player from running into the void.
+const SAFE_STRIP_X = -2;
+const SAFE_STRIP_WIDTH = 12;
+const SAFE_STRIP_HEIGHT = 2;
+const LEFT_PILLAR = { x: -3.5, top: 12, w: 1.5, h: 20 };
+const SPAWN_X = 2;
+const START_FRONTIER_X = 10; // first platform that is generated, not placed
+const INITIAL_WORLD_X = 120; // how much of the level exists from the start
+
+// Scenery. Bushes are listed twice so greenery is the dominant impression.
+const DECOR_TYPES = ["bush", "bush", "tree", "flower", "rock", "lamp"];
+const DECOR_SIZES = [0.6, 0.9, 1.2];
+const DECOR_EDGE_MARGIN = 0.3;
+const EXTRA_DECOR_CHANCE = 0.35; // a second prop on the same platform
+const DECOR_HEIGHT_FACTORS = { tree: 2.2, lamp: 2.4, bush: 1.2 };
+
+// Enemies. A patrolling enemy needs room, otherwise it always stands in a
+// corner and cannot be passed fairly.
+const ENEMY_MIN_WIDTH = 4.5;
+const ENEMY_CHANCE = 0.5;
+const ENEMY_EDGE_MARGIN = 0.4;
+const ENEMY_SIZE = 1.2;
+const ENEMY_SPEED_MIN = 1.2;
+const ENEMY_SPEED_MAX = 3.0;
+
+// Background hills, seen between the city layers.
+const HILL_CHANCE = 0.4;
+const HILL_BACK = [2, 8]; // hills sit behind the platform they belong to
+const HILL_BASE_DROP = 10; // their base stays below the platform top
+const HILL_WIDTH = [10, 26];
+const HILL_HEIGHT = [5, 12];
+
+// Background city: layer 0 is the far skyline (generated almost every chunk so
+// it reads as one continuous city), layer 1 is the nearer and sparser one.
+const CITY_LAYERS = [
+  { layer: 0, chance: 0.9, back: [2, 14], baseDrop: 12, width: [5, 16], height: [6, 20] },
+  { layer: 1, chance: 0.6, back: [1, 9], baseDrop: 8, width: [4, 11], height: [3, 12] },
+];
+
+// Falling out of the level must end the run, but the line has to follow the
+// generated world so a deep chunk is not instantly lethal.
+const DEATH_DROP = 12;
 
 /**
  * Create a new world for a seed.
@@ -197,16 +256,16 @@ function createWorld(seed) {
     decor: [],
     hills: [],
     buildings: [],
-    nextX: 0,
-    top: START_TOP,
-    lowestTop: START_TOP,
-    spawn: { x: 2, y: START_TOP },
+    nextX: 0, // right frontier of the generated level
+    top: START_TOP, // surface height of the last platform
+    lowestTop: START_TOP, // deepest surface seen so far
+    spawn: { x: SPAWN_X, y: START_TOP },
   };
 
-  addPlatform(world, -2, START_TOP, 12, 2, "ground");
-  addPlatform(world, -3.5, 12, 1.5, 20, "wall"); // tall pillar, no escape to the left
-  world.nextX = 10;
-  ensureWorld(world, 120);
+  addPlatform(world, SAFE_STRIP_X, START_TOP, SAFE_STRIP_WIDTH, SAFE_STRIP_HEIGHT, "ground");
+  addPlatform(world, LEFT_PILLAR.x, LEFT_PILLAR.top, LEFT_PILLAR.w, LEFT_PILLAR.h, "wall");
+  world.nextX = START_FRONTIER_X;
+  ensureWorld(world, INITIAL_WORLD_X);
   return world;
 }
 
@@ -218,21 +277,21 @@ function ensureWorld(world, upToX) {
 /**
  * Add one platform at the right frontier of the world, plus optional
  * decoration, an enemy, a background hill and city buildings.
+ * The order of the random rolls is fixed: the seed must always build the same
+ * level, so a value may never be rolled conditionally unless the skip is part
+ * of the design (see the enemy check below).
  */
 function generateChunk(world) {
   const rng = world.rng;
-  // A climb must be reachable, so a rise gets a shorter gap than a flat step
-  // or a drop.
-  const delta = rng() < 0.45 ? int(rng, 0, 2) : -int(rng, 0, 3);
-  const maxGap = delta > 0 ? 2.4 : MAX_GAP;
-  const gap = range(rng, 1.2, maxGap);
-  const x = world.nextX + gap;
 
-  // Height change: mostly small steps, sometimes a bigger drop.
-  const top = clamp(world.top + delta, -6, 18);
-  const w = range(rng, MIN_PLATFORM_WIDTH, 9);
-  const kind = rng() < 0.55 ? "ground" : "float";
-  const h = kind === "ground" ? 3 : 1;
+  // Height change: mostly a small step up, otherwise a bigger drop.
+  const delta = rng() < RISE_CHANCE ? int(rng, 0, MAX_RISE) : -int(rng, 0, MAX_DROP);
+  const gap = range(rng, MIN_GAP, delta > 0 ? MAX_GAP_BEFORE_CLIMB : MAX_GAP);
+  const x = world.nextX + gap;
+  const top = clamp(world.top + delta, MIN_TOP, MAX_TOP);
+  const w = range(rng, MIN_PLATFORM_WIDTH, MAX_PLATFORM_WIDTH);
+  const kind = rng() < GROUND_CHANCE ? "ground" : "float";
+  const h = kind === "ground" ? GROUND_HEIGHT : FLOAT_HEIGHT;
 
   const plat = addPlatform(world, x, top, w, h, kind);
   world.top = top;
@@ -240,50 +299,13 @@ function generateChunk(world) {
   world.nextX = x + w;
 
   addDecor(world, plat);
-  if (rng() < 0.35) addDecor(world, plat);
+  if (rng() < EXTRA_DECOR_CHANCE) addDecor(world, plat);
 
-  if (w >= 4.5 && rng() < 0.5) addEnemy(world, plat);
+  if (w >= ENEMY_MIN_WIDTH && rng() < ENEMY_CHANCE) addEnemy(world, plat);
 
-  if (rng() < 0.4) {
-    world.hills.push({
-      x: x - range(rng, 2, 8),
-      y: top - 10,
-      w: range(rng, 10, 26),
-      h: range(rng, 5, 12),
-    });
-  }
+  if (rng() < HILL_CHANCE) addHill(world, x, top);
 
   addCity(world, x, top);
-}
-
-/**
- * Add city buildings for the parallax background.
- * Layer 0 is the far, dark skyline; layer 1 is the nearer one with lit windows.
- */
-function addCity(world, x, top) {
-  const rng = world.rng;
-  const id = world.buildings.length;
-
-  if (rng() < 0.9) {
-    world.buildings.push({
-      layer: 0,
-      id,
-      x: x - range(rng, 2, 14),
-      y: top - 12,
-      w: range(rng, 5, 16),
-      h: range(rng, 6, 20),
-    });
-  }
-  if (rng() < 0.6) {
-    world.buildings.push({
-      layer: 1,
-      id: id + 1,
-      x: x - range(rng, 1, 9),
-      y: top - 8,
-      w: range(rng, 4, 11),
-      h: range(rng, 3, 12),
-    });
-  }
 }
 
 /**
@@ -299,14 +321,13 @@ function addPlatform(world, x, top, w, h, kind) {
 /** Add scenery (bush, tree, flower, rock or street lamp) sitting on a platform. */
 function addDecor(world, plat) {
   const rng = world.rng;
-  // Bushes are listed twice so greenery is the most common scenery.
-  const type = pick(rng, ["bush", "bush", "tree", "flower", "rock", "lamp"]);
-  const size = pick(rng, [0.6, 0.9, 1.2]);
-  const h = type === "tree" ? size * 2.2 : type === "lamp" ? size * 2.4 : type === "bush" ? size * 1.2 : size;
+  const type = pick(rng, DECOR_TYPES);
+  const size = pick(rng, DECOR_SIZES);
+  const h = size * (DECOR_HEIGHT_FACTORS[type] ?? 1);
 
   world.decor.push({
     type,
-    x: plat.x + range(rng, 0.3, Math.max(0.3, plat.w - size - 0.3)),
+    x: plat.x + range(rng, DECOR_EDGE_MARGIN, Math.max(DECOR_EDGE_MARGIN, plat.w - size - DECOR_EDGE_MARGIN)),
     y: plat.top,
     w: size,
     h,
@@ -316,42 +337,93 @@ function addDecor(world, plat) {
 /** Add an enemy that patrols back and forth on a platform. */
 function addEnemy(world, plat) {
   const rng = world.rng;
-  const margin = 0.4;
-  const w = 1.2;
-  const left = plat.x + margin;
-  const right = plat.x + plat.w - margin - w;
+  const left = plat.x + ENEMY_EDGE_MARGIN;
+  const right = plat.x + plat.w - ENEMY_EDGE_MARGIN - ENEMY_SIZE;
   if (right <= left) return;
 
   world.enemies.push({
     x: range(rng, left, right),
     y: plat.top,
-    w,
-    h: 1.2,
+    w: ENEMY_SIZE,
+    h: ENEMY_SIZE,
     left,
     right,
     dir: rng() < 0.5 ? -1 : 1,
-    speed: range(rng, 1.2, 3.0),
+    speed: range(rng, ENEMY_SPEED_MIN, ENEMY_SPEED_MAX),
     alive: true,
     squash: 0,
   });
 }
 
+/** Add a background hill behind the platform that was just generated. */
+function addHill(world, x, top) {
+  const rng = world.rng;
+  world.hills.push({
+    x: x - range(rng, ...HILL_BACK),
+    y: top - HILL_BASE_DROP,
+    w: range(rng, ...HILL_WIDTH),
+    h: range(rng, ...HILL_HEIGHT),
+  });
+}
+
+/**
+ * Add city buildings for the parallax background, one roll per layer.
+ * The ids are numbered from the first building of this chunk so the window
+ * pattern of a tower stays stable for the seed.
+ */
+function addCity(world, x, top) {
+  const rng = world.rng;
+  const firstId = world.buildings.length;
+
+  for (const [index, layer] of CITY_LAYERS.entries()) {
+    if (rng() >= layer.chance) continue;
+
+    world.buildings.push({
+      layer: layer.layer,
+      id: firstId + index,
+      x: x - range(rng, ...layer.back),
+      y: top - layer.baseDrop,
+      w: range(rng, ...layer.width),
+      h: range(rng, ...layer.height),
+    });
+  }
+}
+
 /** Y below which the player falls to their death. */
 function deathY(world) {
-  return world.lowestTop - 12;
+  return world.lowestTop - DEATH_DROP;
 }
 
 /* ---- src/physics.js ---- */
 // Purpose: Run the game physics - player gravity, jumping, platform collision
 // and the enemy patrol movement - independent of rendering.
+// Every tuning value is a named constant here, so the game feel can be changed
+// in one place without touching the maths.
 
-const GRAVITY = 34;
-const JUMP_VELOCITY = 12;
-const RUN_SPEED = 8.5;
-const ACCEL = 70;
-const MAX_FALL = 28;
-const COYOTE_TIME = 0.1;
-const JUMP_BUFFER = 0.12;
+// Core movement tuning.
+const GRAVITY = 34; // downward acceleration, world units per second^2
+const JUMP_VELOCITY = 12; // starting speed of a full jump
+const RUN_SPEED = 8.5; // top horizontal speed while running
+const ACCEL = 70; // how fast the player reaches RUN_SPEED
+const MAX_FALL = 28; // terminal falling speed
+const COYOTE_TIME = 0.1; // seconds a jump is still allowed after leaving a ledge
+const JUMP_BUFFER = 0.12; // seconds an early jump key press is remembered
+
+// Smaller tuning details.
+const AIR_DRAG = 14; // slows the player down when no key is held
+const STOP_VELOCITY = 0.05; // below this the player is considered standing still
+const FAST_FALL_ACCEL = 24; // extra downward pull while the down key is held
+const SHORT_HOP_FACTOR = 0.4; // jump is cut to this speed when the key is released
+const STOMP_BOUNCE_FACTOR = 0.7; // bounce after stomping an enemy, of JUMP_VELOCITY
+const STOMP_MIN_FEET_FACTOR = 0.4; // part of the enemy height the feet must be above
+const DEFEAT_SQUASH_RATE = 4; // per second: how fast a squashed enemy flattens
+const PLAYER_WIDTH = 1.1;
+const PLAYER_HEIGHT = 1.5;
+
+// Collision tolerances: without them a box that exactly touches a platform edge
+// would be treated as an overlap and the player would catch on every seam.
+const SIDE_TOUCH_EPSILON = 1e-4;
+const LANDING_EPSILON = 1e-3;
 
 /** Return true when two axis-aligned boxes overlap. */
 function intersects(a, b) {
@@ -363,8 +435,8 @@ function createPlayer(x, y) {
   return {
     x,
     y,
-    w: 1.1,
-    h: 1.5,
+    w: PLAYER_WIDTH,
+    h: PLAYER_HEIGHT,
     vx: 0,
     vy: 0,
     onGround: false,
@@ -377,7 +449,7 @@ function createPlayer(x, y) {
 
 /**
  * Advance the player by dt seconds.
- * `input` is { left, right, jump }. Returns the player object.
+ * `input` is { left, right, jump, down } and returns the player object.
  */
 function stepPlayer(p, platforms, dt, input) {
   const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
@@ -388,8 +460,8 @@ function stepPlayer(p, platforms, dt, input) {
     if (p.vx < -RUN_SPEED) p.vx = -RUN_SPEED;
     p.face = dir;
   } else {
-    p.vx *= Math.max(0, 1 - 14 * dt);
-    if (Math.abs(p.vx) < 0.05) p.vx = 0;
+    p.vx *= Math.max(0, 1 - AIR_DRAG * dt);
+    if (Math.abs(p.vx) < STOP_VELOCITY) p.vx = 0;
   }
 
   // Jump with input buffering and coyote time, and shorter hops when the
@@ -403,8 +475,8 @@ function stepPlayer(p, platforms, dt, input) {
     p.coyote = 0;
     p.jumpBuffer = 0;
     p.jumps += 1;
-  } else if (!input.jump && p.vy > JUMP_VELOCITY * 0.4) {
-    p.vy = JUMP_VELOCITY * 0.4;
+  } else if (!input.jump && p.vy > JUMP_VELOCITY * SHORT_HOP_FACTOR) {
+    p.vy = JUMP_VELOCITY * SHORT_HOP_FACTOR;
   }
 
   p.vy = Math.max(p.vy - GRAVITY * dt, -MAX_FALL);
@@ -424,17 +496,21 @@ function stepPlayer(p, platforms, dt, input) {
   p.onGround = false;
 
   for (const plat of platforms) {
-    if (p.x + p.w <= plat.x + 1e-4 || p.x >= plat.x + plat.w - 1e-4) continue;
+    if (p.x + p.w <= plat.x + SIDE_TOUCH_EPSILON || p.x >= plat.x + plat.w - SIDE_TOUCH_EPSILON) continue;
 
-    if (p.vy <= 0 && prevBottom >= plat.top - 1e-3 && p.y < plat.top) {
+    if (p.vy <= 0 && prevBottom >= plat.top - LANDING_EPSILON && p.y < plat.top) {
       p.y = plat.top;
       p.vy = 0;
       p.onGround = true;
-    } else if (p.vy > 0 && prevTop <= plat.y + 1e-3 && p.y + p.h > plat.y) {
+    } else if (p.vy > 0 && prevTop <= plat.y + LANDING_EPSILON && p.y + p.h > plat.y) {
       p.y = plat.y - p.h;
       p.vy = 0;
     }
   }
+
+  // The down key makes the player drop faster. It is applied after the move so
+  // the extra speed only takes effect in the next step, exactly as before.
+  if (input.down && !p.onGround) p.vy -= FAST_FALL_ACCEL * dt;
 
   return p;
 }
@@ -442,9 +518,10 @@ function stepPlayer(p, platforms, dt, input) {
 /** Move a patrolling enemy, turning around at the edges of its platform. */
 function stepEnemy(e, dt) {
   if (!e.alive) {
-    e.squash = Math.min(1, e.squash + dt * 4);
+    e.squash = Math.min(1, e.squash + dt * DEFEAT_SQUASH_RATE);
     return;
   }
+
   e.x += e.dir * e.speed * dt;
   if (e.x <= e.left) {
     e.x = e.left;
@@ -466,11 +543,11 @@ function playerEnemyCollision(p, enemies) {
     if (!e.alive) continue;
     if (!intersects(p, e)) continue;
 
-    const feetAboveMiddle = p.y > e.y + e.h * 0.4;
+    const feetAboveMiddle = p.y > e.y + e.h * STOMP_MIN_FEET_FACTOR;
     if (p.vy <= 0 && feetAboveMiddle) {
       e.alive = false;
       p.y = e.y + e.h;
-      p.vy = JUMP_VELOCITY * 0.7;
+      p.vy = JUMP_VELOCITY * STOMP_BOUNCE_FACTOR;
       return "stomp";
     }
     return "hit";
@@ -480,26 +557,43 @@ function playerEnemyCollision(p, enemies) {
 
 /* ---- src/camera.js ---- */
 // Purpose: Turn the world coordinates of the camera into WebGL clip space
-// coordinates and keep the camera smoothly following the player.
+// coordinates, keep the camera smoothly following the player and provide the
+// shared "how far below the visible area" helper the background layers use.
 
 const VIEW_HEIGHT = 18; // world units visible vertically
+
+// Default distance of a background base line below the bottom edge of the view.
+// Towers and hills are drawn down to this line so they run off the screen
+// instead of ending in mid-air.
+const OFFSCREEN_MARGIN = 40;
+
+// Damping of the camera follow: a larger value snaps the camera harder.
+const CAMERA_SMOOTHING = 6;
+
+// How far the camera looks ahead of the player.
+const CAMERA_LEAD_X = 4;
+const CAMERA_LEAD_Y = 5;
+
+// A new run starts with a wider lead so the player already sees the next
+// platforms when the first frame is drawn.
+const START_CAMERA_LEAD_X = 6;
 
 /** Compute the visible world width/height for a given canvas aspect ratio. */
 function computeView(aspect, height = VIEW_HEIGHT) {
   return { w: height * aspect, h: height };
 }
 
-/** Move the camera towards a target, with a critically damped follow. */
-function followCamera(cam, targetX, targetY, dt) {
-  const k = 1 - Math.exp(-6 * dt);
-  cam.x += (targetX - cam.x) * k;
-  cam.y += (targetY - cam.y) * k;
-  return cam;
-}
-
 /** Create a camera centred on the player. */
 function createCamera(x, y) {
   return { x, y };
+}
+
+/** Move the camera towards a target, with a critically damped follow. */
+function followCamera(cam, targetX, targetY, dt) {
+  const blend = 1 - Math.exp(-CAMERA_SMOOTHING * dt);
+  cam.x += (targetX - cam.x) * blend;
+  cam.y += (targetY - cam.y) * blend;
+  return cam;
 }
 
 /**
@@ -519,6 +613,15 @@ function inView(box, cam, view) {
   return box.x < right && box.x + box.w > left && box.y < top && box.y + box.h > bottom;
 }
 
+/**
+ * World y that lies `margin` units below the bottom edge of the current view.
+ * Background layers use it as their ground line, so every tower reaches past
+ * the bottom of the screen for any camera position.
+ */
+function belowBottom(cam, view, margin = OFFSCREEN_MARGIN) {
+  return cam.y - view.h / 2 - margin;
+}
+
 /* ---- src/jets.js ---- */
 // Purpose: Handle the jet fighters that cross the sky every few seconds and
 // drop a bomb over the player - spawning, the drop, the fall and the explosion
@@ -533,17 +636,28 @@ const JET_MIN_GAP = 4; // shortest pause between two jets
 const JET_MAX_GAP = 8; // longest pause between two jets
 const JET_HEIGHT = 9; // flying height above the player
 const JET_SPAWN_DISTANCE = 20; // how far off screen a jet enters
+const JET_SPEED_MIN = 13; // slowest jet crossing the sky
+const JET_SPEED_MAX = 18; // fastest jet crossing the sky
 const JET_W = 3.4;
 const JET_H = 1.1;
+const JET_CULL_DISTANCE = 45; // jets farther away than this are dropped
 const BOMB_WARNING = 1.5; // seconds between the drop and the impact
+const BOMB_W = 0.55;
+const BOMB_H = 0.8;
+const DROP_ALIGN_TOLERANCE = 0.9; // how exactly the jet must be over the player
 const BLAST_RADIUS = 3.2; // how far the explosion reaches
 const BLAST_DURATION = 0.6; // how long the fireball is drawn
 const MIN_DROP = 4; // smallest distance a bomb is made to fall
+const VOID_MARGIN = 30; // below the deepest top a bomb is lost in the void
+
+// The jet seed is mixed with a large odd prime so the world and the jets do not
+// run on the same random stream.
+const JET_SEED_MIX = 0x9e3779b9;
 
 /** Create the threat state (jets, bombs, explosions) for one run. */
 function createThreats(seed) {
   return {
-    rng: makeRng((seed ^ 0x9e3779b9) >>> 0),
+    rng: makeRng((seed ^ JET_SEED_MIX) >>> 0),
     nextId: 0,
     nextJet: FIRST_JET,
     jets: [],
@@ -751,6 +865,10 @@ function moonTint(altitude) {
 
 
 
+// belowBottom owns the skyline base line. It stays reachable from this module
+// because that is where the tests and the design notes look for it.
+{ belowBottom };
+
 const MAX_QUADS = 15000;
 const FLOATS_PER_VERTEX = 6; // x, y, r, g, b, a
 
@@ -811,15 +929,6 @@ void main() {
 /** Blend two rgb colors, t = 0 returns a, t = 1 returns b. */
 function mix(a, b, t) {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
-}
-
-/**
- * A world y far below the bottom edge of the current view.
- * Background layers use it as their ground line so the towers and hills always
- * run off the bottom of the screen instead of ending in mid-air.
- */
-function belowBottom(cam, view, margin = 40) {
-  return cam.y - view.h / 2 - margin;
 }
 
 /**
@@ -1616,10 +1725,245 @@ async function loadTextures() {
   return loaded;
 }
 
+/* ---- src/hud.js ---- */
+// Purpose: Write the game numbers into the HTML HUD (score, lives, seed, ...),
+// show the bomb warning and the game over overlay, and report which photo
+// textures were loaded. index.html defines the elements by id.
+
+const ALERT_TEXT = "Bomb incoming!"; // shown while a bomb is in the air
+const CREDIT_SEPARATOR = " · ";
+
+/** Find every HUD element the game writes to. */
+function findHudElements() {
+  return {
+    score: document.getElementById("score"),
+    lives: document.getElementById("lives"),
+    seed: document.getElementById("seed"),
+    enemies: document.getElementById("enemies"),
+    distance: document.getElementById("distance"),
+    bombs: document.getElementById("bombs"),
+    status: document.getElementById("status"),
+    alert: document.getElementById("alert"),
+    credits: document.getElementById("credits"),
+    overlay: document.getElementById("overlay"),
+  };
+}
+
+/** Show the counters of the current run in the HUD bar. */
+function updateHud(hud, run, world, threats) {
+  hud.score.textContent = String(run.score);
+  hud.lives.textContent = String(Math.max(0, run.lives));
+  hud.seed.textContent = String(world.seed);
+  hud.enemies.textContent = String(run.stomps);
+  hud.distance.textContent = String(run.farthest);
+  hud.bombs.textContent = String(run.bombsDropped);
+  hud.alert.textContent = threats && threats.bombs.length > 0 ? ALERT_TEXT : "";
+}
+
+/** Show a message in the centred overlay, for example "Game over". */
+function showOverlay(hud, text) {
+  hud.overlay.textContent = text;
+  hud.overlay.classList.remove("hidden");
+}
+
+/** Report how many photo textures really arrived and who made them. */
+function reportTextures(hud, textures) {
+  const loaded = textures.filter((texture) => texture.ok).length;
+  hud.status.textContent = "WebGL ready - " + loaded + " of " + textures.length + " photo textures";
+  hud.credits.textContent = textures.map((texture) => texture.credit).join(CREDIT_SEPARATOR);
+}
+
+/* ---- src/input.js ---- */
+// Purpose: Keep track of the keys that are pressed, hand the physics the input
+// object it expects, and run the key that starts a new world.
+
+const RESTART_KEY = "r"; // starts a run with a fresh random seed
+
+// Keys the page must not react to: without this the player would scroll the
+// document while jumping (space) or running (arrow keys).
+const GAME_KEYS = [" ", "w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"];
+
+/**
+ * Start listening to the keyboard.
+ * `onRestart` runs when the restart key is pressed.
+ * Returns { readInput } for the game loop.
+ */
+function createKeyboard(onRestart) {
+  const pressed = new Set();
+
+  window.addEventListener("keydown", (event) => {
+    const key = event.key.toLowerCase();
+    if (key === RESTART_KEY) {
+      onRestart();
+      return;
+    }
+
+    pressed.add(key);
+    if (GAME_KEYS.includes(key)) event.preventDefault();
+  });
+
+  window.addEventListener("keyup", (event) => pressed.delete(event.key.toLowerCase()));
+
+  return { readInput: () => readInput(pressed) };
+}
+
+/** Turn the pressed keys into the input object used by the physics. */
+function readInput(pressed) {
+  return {
+    left: pressed.has("a") || pressed.has("arrowleft"),
+    right: pressed.has("d") || pressed.has("arrowright"),
+    jump: pressed.has(" ") || pressed.has("w") || pressed.has("arrowup"),
+    down: pressed.has("s") || pressed.has("arrowdown"),
+  };
+}
+
+/* ---- src/debug.js ---- */
+// Purpose: Put the running game on window.__game so the headless browser checks
+// in tools/verify-browser.mjs (and the developer console) can start a run,
+// steer it and read back what is currently on screen.
+// The hooks must keep their names and result shapes: every browser check that
+// fails costs a whole verification run.
+
+
+
+const STOMP_DROP_HEIGHT = 3; // the test player is dropped this far above an enemy
+const STOMP_FALL_SPEED = -6; // speed used while dropping onto it
+const MIN_RECT_PIXELS = 1; // a pixel read-back may never be smaller than one pixel
+
+/**
+ * Install the window.__game object.
+ * `api` is the small set of getters main.js offers: newGame, world, player,
+ * threats, camera, view, canvas, gl, renderFrame, time, moonTime, setMoonPhase,
+ * textures, run and quads.
+ */
+function installDebugHooks(api) {
+  window.__game = {
+    newGame: api.newGame,
+    /** Camera and view, so checks can prove the player is on screen. */
+    camera: api.camera,
+    view: api.view,
+    /** Drop the player above a live enemy so the stomp rule can be checked. */
+    debugStomp: () => dropOntoEnemy(api),
+    /** Force a jet to appear on the next physics step. */
+    spawnJet: () => launchJet(api),
+    /** Where the moon currently is on its arc (clip space, -1..1). */
+    moon: () => moonPosition(api.moonTime()),
+    /** Start the moon arc at a chosen moment of the cycle. */
+    setMoonPhase: (seconds) => {
+      api.setMoonPhase(seconds);
+      return moonPosition(seconds);
+    },
+    /** Which textures were really downloaded and which use the stand-in. */
+    textures: api.textures,
+    /** One platform of the current world, for the pixel checks. */
+    platform: (index) => {
+      const world = api.world();
+      return world ? world.platforms[index] : null;
+    },
+    readWorldRect: (x, y, w, h) => readWorldRect(api, x, y, w, h),
+    state: () => readState(api),
+  };
+}
+
+/**
+ * Read the pixels of a world rectangle straight from the WebGL canvas.
+ * Proves that a photo texture stays anchored to the world while the camera
+ * moves, which a plain pixel diff of two screenshots cannot show.
+ */
+function readWorldRect(api, x, y, w, h) {
+  const gl = api.gl();
+  const canvas = api.canvas();
+  const cam = api.camera();
+  const view = api.view();
+
+  // Redraw first: after a frame is presented the browser may reuse the
+  // framebuffer, so readPixels only reliably sees the geometry just drawn.
+  api.renderFrame();
+
+  const left = ((x - cam.x) * 2) / view.w;
+  const bottom = ((y - cam.y) * 2) / view.h;
+  const right = ((x + w - cam.x) * 2) / view.w;
+  const top = ((y + h - cam.y) * 2) / view.h;
+
+  const px = Math.round(((left + 1) / 2) * canvas.width);
+  const py = Math.round(((bottom + 1) / 2) * canvas.height);
+  const pw = Math.max(MIN_RECT_PIXELS, Math.round(((right - left) / 2) * canvas.width));
+  const ph = Math.max(MIN_RECT_PIXELS, Math.round(((top - bottom) / 2) * canvas.height));
+
+  const pixels = new Uint8Array(pw * ph * 4);
+  gl.readPixels(px, py, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+
+  return {
+    px,
+    py,
+    pw,
+    ph,
+    cam: { x: cam.x, y: cam.y },
+    canvasWidth: canvas.width,
+    canvasHeight: canvas.height,
+    pixels: Array.from(pixels),
+  };
+}
+
+/** Move the player above a live enemy so the next steps stomp it. */
+function dropOntoEnemy(api) {
+  const world = api.world();
+  const player = api.player();
+  if (!world || !player) return null;
+
+  const enemy = world.enemies.find((e) => e.alive);
+  if (!enemy) return null;
+
+  player.x = enemy.x;
+  player.y = enemy.y + STOMP_DROP_HEIGHT;
+  player.vx = 0;
+  player.vy = STOMP_FALL_SPEED;
+  player.onGround = false;
+  return enemy.x;
+}
+
+/** Ask the threat logic for a jet right now instead of after a few seconds. */
+function launchJet(api) {
+  const threats = api.threats();
+  if (!threats) return null;
+
+  threats.nextJet = api.time();
+  return threats.nextJet;
+}
+
+/** Collect the counters and positions the checks compare against. */
+function readState(api) {
+  const world = api.world();
+  const player = api.player();
+  const threats = api.threats();
+  const run = api.run();
+
+  return {
+    seed: world ? world.seed : null,
+    time: api.time(),
+    moon: moonPosition(api.moonTime()),
+    platforms: world ? world.platforms.length : 0,
+    enemies: world ? world.enemies.length : 0,
+    stomps: run.stomps,
+    score: run.score,
+    lives: run.lives,
+    farthest: run.farthest,
+    jets: threats ? threats.jets.length : 0,
+    bombsInAir: threats ? threats.bombs.length : 0,
+    blasts: threats ? threats.blasts.length : 0,
+    bombsDropped: run.bombsDropped,
+    textures: api.textures(),
+    player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
+    quads: api.quads(),
+    enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],
+  };
+}
+
 /* ---- src/main.js ---- */
 // Purpose: Run the jump-and-run game loop: read keyboard input, advance the
-// physics, regenerate the world as the player moves, draw with WebGL and
-// update the HUD.
+// physics, regenerate the world as the player moves, draw with WebGL and update
+// the HUD. This file only connects the modules; all rules live in world.js,
+// physics.js, jets.js and moon.js, all drawing in the renderer modules.
 
 
 
@@ -1628,35 +1972,38 @@ async function loadTextures() {
 
 
 
+
+
+
+// Loop timing.
+const PHYSICS_STEP = 1 / 120; // fixed sub-step for stable collisions
+const MAX_FRAME_TIME = 0.05; // a longer pause (lag) is not simulated
+
+// Run setup.
+const START_LIVES = 3;
+const START_SEED = 1234; // seed used when the URL carries none
+const RANDOM_SEED_RANGE = 0xffffffff; // full 32 bit span for a new world
+const WORLD_AHEAD = 60; // generate this many units before the player
+const PIXEL_RATIO_LIMIT = 2; // more pixels than this buy nothing on any screen
+
+// Scoring.
+const STOMP_SCORE = 100;
+const ENEMY_KILL_SCORE = 50;
+
+const GAME_OVER_TEXT = "Game over - press R for a new world";
+const WEBGL_READY_TEXT = "WebGL ready";
+const WEBGL_BROKEN_TEXT = "This browser cannot render WebGL.";
 
 const canvas = document.getElementById("game");
-const hud = {
-  score: document.getElementById("score"),
-  lives: document.getElementById("lives"),
-  seed: document.getElementById("seed"),
-  enemies: document.getElementById("enemies"),
-  distance: document.getElementById("distance"),
-  bombs: document.getElementById("bombs"),
-  status: document.getElementById("status"),
-  alert: document.getElementById("alert"),
-  credits: document.getElementById("credits"),
-  overlay: document.getElementById("overlay"),
-};
+const hud = findHudElements();
 
-const STEP = 1 / 120; // fixed physics sub-step for stable collisions
-
-const keys = new Set();
 let renderer;
 let world;
 let player;
 let camera;
 let view;
 let threats;
-let lives = 3;
-let score = 0;
-let stomps = 0;
-let bombs = 0;
-let farthest = 0;
+let run = { lives: START_LIVES, score: 0, stomps: 0, bombsDropped: 0, farthest: 0 };
 let time = 0;
 let accumulator = 0;
 let lastFrame = 0;
@@ -1665,49 +2012,36 @@ let gameOver = false;
 let textureInfo = []; // name and source of every texture the renderer has
 let moonOffset = 0; // lets the checks start the moon arc at a chosen moment
 
+const keyboard = createKeyboard(() => newGame(randomSeed()));
+
 /** Start (or restart) a run with a given seed. */
 function newGame(seed) {
   world = createWorld(seed);
   player = createPlayer(world.spawn.x, world.spawn.y);
-  camera = createCamera(world.spawn.x + 6, world.spawn.y + 5);
+  camera = createCamera(world.spawn.x + START_CAMERA_LEAD_X, world.spawn.y + CAMERA_LEAD_Y);
   threats = createThreats(seed);
-  lives = 3;
-  score = 0;
-  stomps = 0;
-  bombs = 0;
-  farthest = 0;
+  run = { lives: START_LIVES, score: 0, stomps: 0, bombsDropped: 0, farthest: 0 };
   gameOver = false;
   hud.overlay.classList.add("hidden");
-  updateHud();
+  updateHud(hud, run, world, threats);
 }
 
 /** Put the player back at the spawn point after a fall or a hit. */
 function respawn() {
-  lives -= 1;
+  run.lives -= 1;
   player.x = world.spawn.x;
   player.y = world.spawn.y;
   player.vx = 0;
   player.vy = 0;
   player.onGround = false;
-  camera.x = world.spawn.x + 4;
-  camera.y = world.spawn.y + 5;
+  camera.x = world.spawn.x + CAMERA_LEAD_X;
+  camera.y = world.spawn.y + CAMERA_LEAD_Y;
 
-  if (lives <= 0) {
+  if (run.lives <= 0) {
     gameOver = true;
-    hud.overlay.textContent = "Game over - press R for a new world";
-    hud.overlay.classList.remove("hidden");
+    showOverlay(hud, GAME_OVER_TEXT);
   }
-  updateHud();
-}
-
-/** Read the pressed keys into the input object used by the physics. */
-function readInput() {
-  return {
-    left: keys.has("a") || keys.has("arrowleft"),
-    right: keys.has("d") || keys.has("arrowright"),
-    jump: keys.has(" ") || keys.has("w") || keys.has("arrowup"),
-    down: keys.has("s") || keys.has("arrowdown"),
-  };
+  updateHud(hud, run, world, threats);
 }
 
 /** Advance the simulation by dt seconds. */
@@ -1715,18 +2049,17 @@ function update(dt) {
   time += dt;
 
   // The world is generated lazily as the player moves to the right.
-  ensureWorld(world, player.x + 60);
+  ensureWorld(world, player.x + WORLD_AHEAD);
 
-  const input = readInput();
+  const input = keyboard.readInput();
   stepPlayer(player, world.platforms, dt, input);
-  if (input.down && !player.onGround) player.vy -= 24 * dt;
 
   for (const enemy of world.enemies) stepEnemy(enemy, dt);
 
   const hit = playerEnemyCollision(player, world.enemies);
   if (hit === "stomp") {
-    stomps += 1;
-    score += 100;
+    run.stomps += 1;
+    run.score += STOMP_SCORE;
   } else if (hit === "hit") {
     respawn();
   }
@@ -1734,33 +2067,20 @@ function update(dt) {
   // Jets cross the sky and drop bombs; the blast kills enemies and can hit the
   // player, which costs a life just like touching an enemy.
   const events = stepThreats(threats, world, player, dt, time);
-  if (events.bombDropped) bombs += 1;
-  if (events.enemiesKilled) score += events.enemiesKilled * 50;
+  if (events.bombDropped) run.bombsDropped += 1;
+  if (events.enemiesKilled) run.score += events.enemiesKilled * ENEMY_KILL_SCORE;
   if (events.playerHit) respawn();
 
   if (player.y < deathY(world)) respawn();
 
-  farthest = Math.max(farthest, Math.floor(player.x));
-  score += 0; // distance is tracked separately
-  followCamera(camera, player.x + 4, player.y + 5, dt);
-  updateHud();
-}
-
-/** Refresh the HUD numbers. */
-function updateHud() {
-  hud.score.textContent = String(score);
-  hud.lives.textContent = String(Math.max(0, lives));
-  hud.seed.textContent = String(world.seed);
-  hud.enemies.textContent = String(stomps);
-  hud.distance.textContent = String(farthest);
-  hud.bombs.textContent = String(bombs);
-  // Warn the player while a bomb is in the air.
-  hud.alert.textContent = threats && threats.bombs.length > 0 ? "Bomb incoming!" : "";
+  run.farthest = Math.max(run.farthest, Math.floor(player.x));
+  followCamera(camera, player.x + CAMERA_LEAD_X, player.y + CAMERA_LEAD_Y, dt);
+  updateHud(hud, run, world, threats);
 }
 
 /** Fit the canvas and the view rectangle to the window size. */
 function resize() {
-  const scale = Math.min(2, window.devicePixelRatio || 1);
+  const scale = Math.min(PIXEL_RATIO_LIMIT, window.devicePixelRatio || 1);
   renderer.resize(window.innerWidth, window.innerHeight, scale);
   view = computeView(canvas.width / canvas.height);
   canvas.style.width = window.innerWidth + "px";
@@ -1782,16 +2102,18 @@ function renderFrame() {
   return lastQuads;
 }
 
-/** Main animation loop. */
+/** Animation loop: fixed physics steps, then one draw per frame. */
 function loop(now) {
-  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  const frameTime = Math.min(MAX_FRAME_TIME, (now - lastFrame) / 1000);
   lastFrame = now;
 
+  // After a game over the clock stops: the moon and the bombs stay where they
+  // are, so a screenshot check of the last frame stays meaningful.
   if (!gameOver) {
-    accumulator += dt;
-    while (accumulator >= STEP) {
-      update(STEP);
-      accumulator -= STEP;
+    accumulator += frameTime;
+    while (accumulator >= PHYSICS_STEP) {
+      update(PHYSICS_STEP);
+      accumulator -= PHYSICS_STEP;
     }
   }
 
@@ -1799,130 +2121,64 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
-/** Handle key presses for gameplay and world regeneration. */
-window.addEventListener("keydown", (event) => {
-  const key = event.key.toLowerCase();
-  if (key === "r") {
-    newGame((Math.random() * 0xffffffff) >>> 0);
-    return;
-  }
-  keys.add(key);
-  if ([" ", "w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
-    event.preventDefault();
-  }
-});
-
-window.addEventListener("keyup", (event) => keys.delete(event.key.toLowerCase()));
-window.addEventListener("resize", resize);
-
 /** Download the photo textures and hand them to the renderer. */
 function loadTextureSet() {
   loadTextures().then((textures) => {
     renderer.setTextures(textures);
-    textureInfo = textures.map((t) => ({ name: t.name, source: t.source, credit: t.credit }));
-
-    const real = textures.filter((t) => t.ok).length;
-    hud.status.textContent = "WebGL ready - " + real + " of " + textures.length + " photo textures";
-    hud.credits.textContent = textures.map((t) => t.credit).join(" · ");
+    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit }));
+    reportTextures(hud, textures);
   });
 }
 
-try {
-  renderer = createRenderer(canvas);
-  resize();
+/** Read the seed from ?seed=... in the address, otherwise use the default. */
+function seedFromUrl() {
   const fromUrl = new URLSearchParams(window.location.search).get("seed");
-  newGame(fromUrl ? Number(fromUrl) : 1234);
-  hud.status.textContent = "WebGL ready";
-  loadTextureSet();
-  requestAnimationFrame(loop);
-} catch (error) {
-  hud.status.textContent = "Error: " + error.message;
-  hud.overlay.textContent = "This browser cannot render WebGL.";
-  hud.overlay.classList.remove("hidden");
+  return fromUrl ? Number(fromUrl) : START_SEED;
 }
 
+/** A fresh seed for a new world started with the R key. */
+function randomSeed() {
+  return (Math.random() * RANDOM_SEED_RANGE) >>> 0;
+}
+
+/** Boot the game and report a missing WebGL support in the HUD. */
+function start() {
+  try {
+    renderer = createRenderer(canvas);
+    resize();
+    newGame(seedFromUrl());
+    hud.status.textContent = WEBGL_READY_TEXT;
+    loadTextureSet();
+    requestAnimationFrame(loop);
+  } catch (error) {
+    hud.status.textContent = "Error: " + error.message;
+    showOverlay(hud, WEBGL_BROKEN_TEXT);
+  }
+}
+
+window.addEventListener("resize", resize);
+start();
+
 // Verification hooks used by the headless browser checks and the console.
-window.__game = {
+installDebugHooks({
   newGame,
-  /** Expose the camera and view so checks can verify the player is on screen. */
+  world: () => world,
+  player: () => player,
+  threats: () => threats,
   camera: () => camera,
   view: () => view,
-  /** Drop the player above a live enemy so the stomp rule can be checked. */
-  debugStomp: () => {
-    if (!world) return null;
-    const enemy = world.enemies.find((e) => e.alive);
-    if (!enemy) return null;
-    player.x = enemy.x;
-    player.y = enemy.y + 3;
-    player.vx = 0;
-    player.vy = -6;
-    player.onGround = false;
-    return enemy.x;
-  },
-  /** Force a jet to appear on the next physics step (used by the browser checks). */
-  spawnJet: () => {
-    if (!threats) return null;
-    threats.nextJet = time;
-    return threats.nextJet;
-  },
-  /** Where the moon currently is on its arc (clip space, -1..1). */
-  moon: () => moonPosition(time + moonOffset),
-  /** Start the moon arc at a chosen moment of the cycle (used by the checks). */
+  canvas: () => canvas,
+  gl: () => renderer.gl,
+  renderFrame,
+  time: () => time,
+  moonTime: () => time + moonOffset,
   setMoonPhase: (seconds) => {
     moonOffset = seconds - time;
-    return moonPosition(seconds);
   },
-  /** Which textures were really downloaded and which use the stand-in. */
   textures: () => textureInfo,
-  /** One platform of the current world, for the pixel checks. */
-  platform: (index) => (world ? world.platforms[index] : null),
-  /**
-   * Read the pixels of a world rectangle straight from the WebGL canvas.
-   * Used by the browser checks to prove that a texture stays anchored to the
-   * world while the camera moves.
-   */
-  readWorldRect: (x, y, w, h) => {
-    const gl = renderer.gl;
-
-    // Redraw first: after a frame is presented the browser may reuse the
-    // framebuffer, so readPixels only reliably sees the geometry just drawn.
-    renderFrame();
-
-    const x1 = ((x - camera.x) * 2) / view.w;
-    const y1 = ((y - camera.y) * 2) / view.h;
-    const x2 = ((x + w - camera.x) * 2) / view.w;
-    const y2 = ((y + h - camera.y) * 2) / view.h;
-
-    const px = Math.round(((x1 + 1) / 2) * canvas.width);
-    const py = Math.round(((y1 + 1) / 2) * canvas.height);
-    const pw = Math.max(1, Math.round(((x2 - x1) / 2) * canvas.width));
-    const ph = Math.max(1, Math.round(((y2 - y1) / 2) * canvas.height));
-
-    const pixels = new Uint8Array(pw * ph * 4);
-    gl.readPixels(px, py, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-
-    return { px, py, pw, ph, cam: { x: camera.x, y: camera.y }, canvasWidth: canvas.width, canvasHeight: canvas.height, pixels: Array.from(pixels) };
-  },
-  state: () => ({
-    seed: world ? world.seed : null,
-    time,
-    moon: moonPosition(time + moonOffset),
-    platforms: world ? world.platforms.length : 0,
-    enemies: world ? world.enemies.length : 0,
-    stomps,
-    score,
-    lives,
-    farthest,
-    jets: threats ? threats.jets.length : 0,
-    bombsInAir: threats ? threats.bombs.length : 0,
-    blasts: threats ? threats.blasts.length : 0,
-    bombsDropped: bombs,
-    textures: textureInfo,
-    player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
-    quads: lastQuads,
-    enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],
-  }),
-};
+  run: () => run,
+  quads: () => lastQuads,
+});
 
 </script>
   </body>

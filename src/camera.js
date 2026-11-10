@@ -16,6 +16,10 @@ const CAMERA_SMOOTHING = 6;
 export const CAMERA_LEAD_X = 4;
 export const CAMERA_LEAD_Y = 5;
 
+// A new run starts with a wider lead so the player already sees the next
+// platforms when the first frame is drawn.
+export const START_CAMERA_LEAD_X = 6;
+
 /** Compute the visible world width/height for a given canvas aspect ratio. */
 export function computeView(aspect, height = VIEW_HEIGHT) {
   return { w: height * aspect, h: height };

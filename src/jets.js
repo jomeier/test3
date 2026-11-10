@@ -11,17 +11,28 @@ export const JET_MIN_GAP = 4; // shortest pause between two jets
 export const JET_MAX_GAP = 8; // longest pause between two jets
 export const JET_HEIGHT = 9; // flying height above the player
 export const JET_SPAWN_DISTANCE = 20; // how far off screen a jet enters
+export const JET_SPEED_MIN = 13; // slowest jet crossing the sky
+export const JET_SPEED_MAX = 18; // fastest jet crossing the sky
 export const JET_W = 3.4;
 export const JET_H = 1.1;
+export const JET_CULL_DISTANCE = 45; // jets farther away than this are dropped
 export const BOMB_WARNING = 1.5; // seconds between the drop and the impact
+export const BOMB_W = 0.55;
+export const BOMB_H = 0.8;
+export const DROP_ALIGN_TOLERANCE = 0.9; // how exactly the jet must be over the player
 export const BLAST_RADIUS = 3.2; // how far the explosion reaches
 export const BLAST_DURATION = 0.6; // how long the fireball is drawn
 export const MIN_DROP = 4; // smallest distance a bomb is made to fall
+export const VOID_MARGIN = 30; // below the deepest top a bomb is lost in the void
+
+// The jet seed is mixed with a large odd prime so the world and the jets do not
+// run on the same random stream.
+const JET_SEED_MIX = 0x9e3779b9;
 
 /** Create the threat state (jets, bombs, explosions) for one run. */
 export function createThreats(seed) {
   return {
-    rng: makeRng((seed ^ 0x9e3779b9) >>> 0),
+    rng: makeRng((seed ^ JET_SEED_MIX) >>> 0),
     nextId: 0,
     nextJet: FIRST_JET,
     jets: [],

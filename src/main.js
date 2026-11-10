@@ -1,43 +1,47 @@
 // Purpose: Run the jump-and-run game loop: read keyboard input, advance the
-// physics, regenerate the world as the player moves, draw with WebGL and
-// update the HUD.
+// physics, regenerate the world as the player moves, draw with WebGL and update
+// the HUD. This file only connects the modules; all rules live in world.js,
+// physics.js, jets.js and moon.js, all drawing in the renderer modules.
 
 import { createWorld, ensureWorld, deathY } from "./world.js";
 import { createPlayer, stepPlayer, stepEnemy, playerEnemyCollision } from "./physics.js";
-import { createCamera, computeView, followCamera } from "./camera.js";
+import { createCamera, computeView, followCamera, CAMERA_LEAD_X, CAMERA_LEAD_Y, START_CAMERA_LEAD_X } from "./camera.js";
 import { createRenderer } from "./renderer.js";
 import { createThreats, stepThreats } from "./jets.js";
 import { loadTextures } from "./textures.js";
-import { moonPosition } from "./moon.js";
+import { findHudElements, updateHud, showOverlay, reportTextures } from "./hud.js";
+import { createKeyboard } from "./input.js";
+import { installDebugHooks } from "./debug.js";
+
+// Loop timing.
+const PHYSICS_STEP = 1 / 120; // fixed sub-step for stable collisions
+const MAX_FRAME_TIME = 0.05; // a longer pause (lag) is not simulated
+
+// Run setup.
+const START_LIVES = 3;
+const START_SEED = 1234; // seed used when the URL carries none
+const RANDOM_SEED_RANGE = 0xffffffff; // full 32 bit span for a new world
+const WORLD_AHEAD = 60; // generate this many units before the player
+const PIXEL_RATIO_LIMIT = 2; // more pixels than this buy nothing on any screen
+
+// Scoring.
+const STOMP_SCORE = 100;
+const ENEMY_KILL_SCORE = 50;
+
+const GAME_OVER_TEXT = "Game over - press R for a new world";
+const WEBGL_READY_TEXT = "WebGL ready";
+const WEBGL_BROKEN_TEXT = "This browser cannot render WebGL.";
 
 const canvas = document.getElementById("game");
-const hud = {
-  score: document.getElementById("score"),
-  lives: document.getElementById("lives"),
-  seed: document.getElementById("seed"),
-  enemies: document.getElementById("enemies"),
-  distance: document.getElementById("distance"),
-  bombs: document.getElementById("bombs"),
-  status: document.getElementById("status"),
-  alert: document.getElementById("alert"),
-  credits: document.getElementById("credits"),
-  overlay: document.getElementById("overlay"),
-};
+const hud = findHudElements();
 
-const STEP = 1 / 120; // fixed physics sub-step for stable collisions
-
-const keys = new Set();
 let renderer;
 let world;
 let player;
 let camera;
 let view;
 let threats;
-let lives = 3;
-let score = 0;
-let stomps = 0;
-let bombs = 0;
-let farthest = 0;
+let run = { lives: START_LIVES, score: 0, stomps: 0, bombsDropped: 0, farthest: 0 };
 let time = 0;
 let accumulator = 0;
 let lastFrame = 0;
@@ -46,49 +50,36 @@ let gameOver = false;
 let textureInfo = []; // name and source of every texture the renderer has
 let moonOffset = 0; // lets the checks start the moon arc at a chosen moment
 
+const keyboard = createKeyboard(() => newGame(randomSeed()));
+
 /** Start (or restart) a run with a given seed. */
 function newGame(seed) {
   world = createWorld(seed);
   player = createPlayer(world.spawn.x, world.spawn.y);
-  camera = createCamera(world.spawn.x + 6, world.spawn.y + 5);
+  camera = createCamera(world.spawn.x + START_CAMERA_LEAD_X, world.spawn.y + CAMERA_LEAD_Y);
   threats = createThreats(seed);
-  lives = 3;
-  score = 0;
-  stomps = 0;
-  bombs = 0;
-  farthest = 0;
+  run = { lives: START_LIVES, score: 0, stomps: 0, bombsDropped: 0, farthest: 0 };
   gameOver = false;
   hud.overlay.classList.add("hidden");
-  updateHud();
+  updateHud(hud, run, world, threats);
 }
 
 /** Put the player back at the spawn point after a fall or a hit. */
 function respawn() {
-  lives -= 1;
+  run.lives -= 1;
   player.x = world.spawn.x;
   player.y = world.spawn.y;
   player.vx = 0;
   player.vy = 0;
   player.onGround = false;
-  camera.x = world.spawn.x + 4;
-  camera.y = world.spawn.y + 5;
+  camera.x = world.spawn.x + CAMERA_LEAD_X;
+  camera.y = world.spawn.y + CAMERA_LEAD_Y;
 
-  if (lives <= 0) {
+  if (run.lives <= 0) {
     gameOver = true;
-    hud.overlay.textContent = "Game over - press R for a new world";
-    hud.overlay.classList.remove("hidden");
+    showOverlay(hud, GAME_OVER_TEXT);
   }
-  updateHud();
-}
-
-/** Read the pressed keys into the input object used by the physics. */
-function readInput() {
-  return {
-    left: keys.has("a") || keys.has("arrowleft"),
-    right: keys.has("d") || keys.has("arrowright"),
-    jump: keys.has(" ") || keys.has("w") || keys.has("arrowup"),
-    down: keys.has("s") || keys.has("arrowdown"),
-  };
+  updateHud(hud, run, world, threats);
 }
 
 /** Advance the simulation by dt seconds. */
@@ -96,18 +87,17 @@ function update(dt) {
   time += dt;
 
   // The world is generated lazily as the player moves to the right.
-  ensureWorld(world, player.x + 60);
+  ensureWorld(world, player.x + WORLD_AHEAD);
 
-  const input = readInput();
+  const input = keyboard.readInput();
   stepPlayer(player, world.platforms, dt, input);
-  if (input.down && !player.onGround) player.vy -= 24 * dt;
 
   for (const enemy of world.enemies) stepEnemy(enemy, dt);
 
   const hit = playerEnemyCollision(player, world.enemies);
   if (hit === "stomp") {
-    stomps += 1;
-    score += 100;
+    run.stomps += 1;
+    run.score += STOMP_SCORE;
   } else if (hit === "hit") {
     respawn();
   }
@@ -115,33 +105,20 @@ function update(dt) {
   // Jets cross the sky and drop bombs; the blast kills enemies and can hit the
   // player, which costs a life just like touching an enemy.
   const events = stepThreats(threats, world, player, dt, time);
-  if (events.bombDropped) bombs += 1;
-  if (events.enemiesKilled) score += events.enemiesKilled * 50;
+  if (events.bombDropped) run.bombsDropped += 1;
+  if (events.enemiesKilled) run.score += events.enemiesKilled * ENEMY_KILL_SCORE;
   if (events.playerHit) respawn();
 
   if (player.y < deathY(world)) respawn();
 
-  farthest = Math.max(farthest, Math.floor(player.x));
-  score += 0; // distance is tracked separately
-  followCamera(camera, player.x + 4, player.y + 5, dt);
-  updateHud();
-}
-
-/** Refresh the HUD numbers. */
-function updateHud() {
-  hud.score.textContent = String(score);
-  hud.lives.textContent = String(Math.max(0, lives));
-  hud.seed.textContent = String(world.seed);
-  hud.enemies.textContent = String(stomps);
-  hud.distance.textContent = String(farthest);
-  hud.bombs.textContent = String(bombs);
-  // Warn the player while a bomb is in the air.
-  hud.alert.textContent = threats && threats.bombs.length > 0 ? "Bomb incoming!" : "";
+  run.farthest = Math.max(run.farthest, Math.floor(player.x));
+  followCamera(camera, player.x + CAMERA_LEAD_X, player.y + CAMERA_LEAD_Y, dt);
+  updateHud(hud, run, world, threats);
 }
 
 /** Fit the canvas and the view rectangle to the window size. */
 function resize() {
-  const scale = Math.min(2, window.devicePixelRatio || 1);
+  const scale = Math.min(PIXEL_RATIO_LIMIT, window.devicePixelRatio || 1);
   renderer.resize(window.innerWidth, window.innerHeight, scale);
   view = computeView(canvas.width / canvas.height);
   canvas.style.width = window.innerWidth + "px";
@@ -163,16 +140,18 @@ function renderFrame() {
   return lastQuads;
 }
 
-/** Main animation loop. */
+/** Animation loop: fixed physics steps, then one draw per frame. */
 function loop(now) {
-  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  const frameTime = Math.min(MAX_FRAME_TIME, (now - lastFrame) / 1000);
   lastFrame = now;
 
+  // After a game over the clock stops: the moon and the bombs stay where they
+  // are, so a screenshot check of the last frame stays meaningful.
   if (!gameOver) {
-    accumulator += dt;
-    while (accumulator >= STEP) {
-      update(STEP);
-      accumulator -= STEP;
+    accumulator += frameTime;
+    while (accumulator >= PHYSICS_STEP) {
+      update(PHYSICS_STEP);
+      accumulator -= PHYSICS_STEP;
     }
   }
 
@@ -180,127 +159,61 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
-/** Handle key presses for gameplay and world regeneration. */
-window.addEventListener("keydown", (event) => {
-  const key = event.key.toLowerCase();
-  if (key === "r") {
-    newGame((Math.random() * 0xffffffff) >>> 0);
-    return;
-  }
-  keys.add(key);
-  if ([" ", "w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
-    event.preventDefault();
-  }
-});
-
-window.addEventListener("keyup", (event) => keys.delete(event.key.toLowerCase()));
-window.addEventListener("resize", resize);
-
 /** Download the photo textures and hand them to the renderer. */
 function loadTextureSet() {
   loadTextures().then((textures) => {
     renderer.setTextures(textures);
-    textureInfo = textures.map((t) => ({ name: t.name, source: t.source, credit: t.credit }));
-
-    const real = textures.filter((t) => t.ok).length;
-    hud.status.textContent = "WebGL ready - " + real + " of " + textures.length + " photo textures";
-    hud.credits.textContent = textures.map((t) => t.credit).join(" · ");
+    textureInfo = textures.map((texture) => ({ name: texture.name, source: texture.source, credit: texture.credit }));
+    reportTextures(hud, textures);
   });
 }
 
-try {
-  renderer = createRenderer(canvas);
-  resize();
+/** Read the seed from ?seed=... in the address, otherwise use the default. */
+function seedFromUrl() {
   const fromUrl = new URLSearchParams(window.location.search).get("seed");
-  newGame(fromUrl ? Number(fromUrl) : 1234);
-  hud.status.textContent = "WebGL ready";
-  loadTextureSet();
-  requestAnimationFrame(loop);
-} catch (error) {
-  hud.status.textContent = "Error: " + error.message;
-  hud.overlay.textContent = "This browser cannot render WebGL.";
-  hud.overlay.classList.remove("hidden");
+  return fromUrl ? Number(fromUrl) : START_SEED;
 }
 
+/** A fresh seed for a new world started with the R key. */
+function randomSeed() {
+  return (Math.random() * RANDOM_SEED_RANGE) >>> 0;
+}
+
+/** Boot the game and report a missing WebGL support in the HUD. */
+function start() {
+  try {
+    renderer = createRenderer(canvas);
+    resize();
+    newGame(seedFromUrl());
+    hud.status.textContent = WEBGL_READY_TEXT;
+    loadTextureSet();
+    requestAnimationFrame(loop);
+  } catch (error) {
+    hud.status.textContent = "Error: " + error.message;
+    showOverlay(hud, WEBGL_BROKEN_TEXT);
+  }
+}
+
+window.addEventListener("resize", resize);
+start();
+
 // Verification hooks used by the headless browser checks and the console.
-window.__game = {
+installDebugHooks({
   newGame,
-  /** Expose the camera and view so checks can verify the player is on screen. */
+  world: () => world,
+  player: () => player,
+  threats: () => threats,
   camera: () => camera,
   view: () => view,
-  /** Drop the player above a live enemy so the stomp rule can be checked. */
-  debugStomp: () => {
-    if (!world) return null;
-    const enemy = world.enemies.find((e) => e.alive);
-    if (!enemy) return null;
-    player.x = enemy.x;
-    player.y = enemy.y + 3;
-    player.vx = 0;
-    player.vy = -6;
-    player.onGround = false;
-    return enemy.x;
-  },
-  /** Force a jet to appear on the next physics step (used by the browser checks). */
-  spawnJet: () => {
-    if (!threats) return null;
-    threats.nextJet = time;
-    return threats.nextJet;
-  },
-  /** Where the moon currently is on its arc (clip space, -1..1). */
-  moon: () => moonPosition(time + moonOffset),
-  /** Start the moon arc at a chosen moment of the cycle (used by the checks). */
+  canvas: () => canvas,
+  gl: () => renderer.gl,
+  renderFrame,
+  time: () => time,
+  moonTime: () => time + moonOffset,
   setMoonPhase: (seconds) => {
     moonOffset = seconds - time;
-    return moonPosition(seconds);
   },
-  /** Which textures were really downloaded and which use the stand-in. */
   textures: () => textureInfo,
-  /** One platform of the current world, for the pixel checks. */
-  platform: (index) => (world ? world.platforms[index] : null),
-  /**
-   * Read the pixels of a world rectangle straight from the WebGL canvas.
-   * Used by the browser checks to prove that a texture stays anchored to the
-   * world while the camera moves.
-   */
-  readWorldRect: (x, y, w, h) => {
-    const gl = renderer.gl;
-
-    // Redraw first: after a frame is presented the browser may reuse the
-    // framebuffer, so readPixels only reliably sees the geometry just drawn.
-    renderFrame();
-
-    const x1 = ((x - camera.x) * 2) / view.w;
-    const y1 = ((y - camera.y) * 2) / view.h;
-    const x2 = ((x + w - camera.x) * 2) / view.w;
-    const y2 = ((y + h - camera.y) * 2) / view.h;
-
-    const px = Math.round(((x1 + 1) / 2) * canvas.width);
-    const py = Math.round(((y1 + 1) / 2) * canvas.height);
-    const pw = Math.max(1, Math.round(((x2 - x1) / 2) * canvas.width));
-    const ph = Math.max(1, Math.round(((y2 - y1) / 2) * canvas.height));
-
-    const pixels = new Uint8Array(pw * ph * 4);
-    gl.readPixels(px, py, pw, ph, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-
-    return { px, py, pw, ph, cam: { x: camera.x, y: camera.y }, canvasWidth: canvas.width, canvasHeight: canvas.height, pixels: Array.from(pixels) };
-  },
-  state: () => ({
-    seed: world ? world.seed : null,
-    time,
-    moon: moonPosition(time + moonOffset),
-    platforms: world ? world.platforms.length : 0,
-    enemies: world ? world.enemies.length : 0,
-    stomps,
-    score,
-    lives,
-    farthest,
-    jets: threats ? threats.jets.length : 0,
-    bombsInAir: threats ? threats.bombs.length : 0,
-    blasts: threats ? threats.blasts.length : 0,
-    bombsDropped: bombs,
-    textures: textureInfo,
-    player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,
-    quads: lastQuads,
-    enemiesMoving: world ? world.enemies.filter((e) => e.alive).map((e) => ({ x: e.x, dir: e.dir })) : [],
-  }),
-};
+  run: () => run,
+  quads: () => lastQuads,
+});
