@@ -139,10 +139,10 @@ function drawWindows(painter, building, cam, isNear, time, wallColour, roof, bas
 function drawRoofAdditions(painter, building, cam, isNear, roof) {
   if (!isNear) return;
 
-  if (hash(building.id, 17) > ANTENNA_HASH_MIN) {
+  if (hash(building.id, ANTENNA_HASH_SALT) > ANTENNA_HASH_MIN) {
     painter.rect(building.x + building.w * ANTENNA_X_FACTOR, roof + ROOF_EDGE_HEIGHT, ANTENNA_WIDTH, ANTENNA_HEIGHT, ANTENNA_COLOUR, cam);
   }
-  if (hash(building.id, 29) > SIDE_TOWER_HASH_MIN) {
+  if (hash(building.id, SIDE_TOWER_HASH_SALT) > SIDE_TOWER_HASH_MIN) {
     painter.rect(
       building.x - SIDE_TOWER_WIDTH,
       roof - building.h * SIDE_TOWER_HEIGHT_FACTOR,

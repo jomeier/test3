@@ -1417,10 +1417,10 @@ function drawWindows(painter, building, cam, isNear, time, wallColour, roof, bas
 function drawRoofAdditions(painter, building, cam, isNear, roof) {
   if (!isNear) return;
 
-  if (hash(building.id, 17) > ANTENNA_HASH_MIN) {
+  if (hash(building.id, ANTENNA_HASH_SALT) > ANTENNA_HASH_MIN) {
     painter.rect(building.x + building.w * ANTENNA_X_FACTOR, roof + ROOF_EDGE_HEIGHT, ANTENNA_WIDTH, ANTENNA_HEIGHT, ANTENNA_COLOUR, cam);
   }
-  if (hash(building.id, 29) > SIDE_TOWER_HASH_MIN) {
+  if (hash(building.id, SIDE_TOWER_HASH_SALT) > SIDE_TOWER_HASH_MIN) {
     painter.rect(
       building.x - SIDE_TOWER_WIDTH,
       roof - building.h * SIDE_TOWER_HEIGHT_FACTOR,
@@ -1873,7 +1873,7 @@ function stepThreats(threats, world, player, dt, time) {
       x: player.x - dir * JET_SPAWN_DISTANCE,
       y: player.y + JET_HEIGHT,
       dir,
-      speed: range(threats.rng, 13, 18),
+      speed: range(threats.rng, JET_SPEED_MIN, JET_SPEED_MAX),
       w: JET_W,
       h: JET_H,
       dropped: false,
@@ -1890,7 +1890,7 @@ function stepThreats(threats, world, player, dt, time) {
     if (!jet.dropped) {
       const jetCenter = jet.x + jet.w / 2;
       const playerCenter = player.x + player.w / 2;
-      if (Math.abs(jetCenter - playerCenter) < 0.9) {
+      if (Math.abs(jetCenter - playerCenter) < DROP_ALIGN_TOLERANCE) {
         const targetY = surfaceBelow(world, jetCenter, jet.y);
         // The fall is measured from the jet, so it may pass through the player
         // or the decor on the way down; only the blast itself is dangerous.
@@ -1905,8 +1905,8 @@ function stepThreats(threats, world, player, dt, time) {
           vy: 0,
           g: (2 * Math.max(MIN_DROP, drop)) / (BOMB_WARNING * BOMB_WARNING),
           targetY,
-          w: 0.55,
-          h: 0.8,
+          w: BOMB_W,
+          h: BOMB_H,
           droppedAt: time,
         });
         jet.dropped = true;
@@ -1916,7 +1916,7 @@ function stepThreats(threats, world, player, dt, time) {
   }
 
   // Remove jets that have flown out of the world.
-  threats.jets = threats.jets.filter((jet) => Math.abs(jet.x - player.x) < 45);
+  threats.jets = threats.jets.filter((jet) => Math.abs(jet.x - player.x) < JET_CULL_DISTANCE);
 
   // Bombs fall straight down and explode on the first solid surface.
   for (const bomb of threats.bombs) {
@@ -1927,7 +1927,7 @@ function stepThreats(threats, world, player, dt, time) {
       bomb.y = bomb.targetY;
       explode(threats, world, player, bomb, time, events);
       bomb.dead = true;
-    } else if (bomb.y < world.lowestTop - 30) {
+    } else if (bomb.y < world.lowestTop - VOID_MARGIN) {
       bomb.dead = true; // fell into the void without a blast
     }
   }
@@ -2088,7 +2088,7 @@ function drawBomb(painter, bomb, cam, time) {
 
   // The bomb itself: dark body, fins and a blinking fuse light.
   painter.rect(bomb.x - bomb.w / 2, bomb.y, bomb.w, bomb.h, BOMB_BODY_COLOUR, cam, BOMB_BODY_TOP_COLOUR);
-  painter.rect(bomb.x - (BOMB_FIN_WIDTH_FACTOR * bomb.w) / 2, bomb.y + bomb.h, BOMB_FIN_WIDTH_FACTOR * bomb.w, BOMB_FIN_HEIGHT, BOMB_FIN_COLOUR, cam);
+  painter.rect(bomb.x - BOMB_FIN_WIDTH / 2, bomb.y + bomb.h, BOMB_FIN_WIDTH, BOMB_FIN_HEIGHT, BOMB_FIN_COLOUR, cam);
   const lightY = bomb.y + bomb.h + BOMB_FIN_HEIGHT;
   painter.rect(bomb.x - BOMB_LIGHT_SIDE, lightY, BOMB_LIGHT_WIDTH, BOMB_LIGHT_HEIGHT, isBright ? BOMB_LIGHT_BRIGHT : BOMB_LIGHT_DIM, cam);
 }
@@ -2593,6 +2593,9 @@ function readState(api) {
     jets: threats ? threats.jets.length : 0,
     bombsInAir: threats ? threats.bombs.length : 0,
     blasts: threats ? threats.blasts.length : 0,
+    // Game seconds between the last drop and its explosion. Measured inside the
+    // simulation, so the browser check does not have to poll this clock.
+    warningDelay: threats ? threats.lastWarningDelay : null,
     bombsDropped: run.bombsDropped,
     textures: api.textures(),
     player: player ? { x: player.x, y: player.y, vy: player.vy, onGround: player.onGround } : null,

@@ -77,7 +77,7 @@ export function stepThreats(threats, world, player, dt, time) {
       x: player.x - dir * JET_SPAWN_DISTANCE,
       y: player.y + JET_HEIGHT,
       dir,
-      speed: range(threats.rng, 13, 18),
+      speed: range(threats.rng, JET_SPEED_MIN, JET_SPEED_MAX),
       w: JET_W,
       h: JET_H,
       dropped: false,
@@ -94,7 +94,7 @@ export function stepThreats(threats, world, player, dt, time) {
     if (!jet.dropped) {
       const jetCenter = jet.x + jet.w / 2;
       const playerCenter = player.x + player.w / 2;
-      if (Math.abs(jetCenter - playerCenter) < 0.9) {
+      if (Math.abs(jetCenter - playerCenter) < DROP_ALIGN_TOLERANCE) {
         const targetY = surfaceBelow(world, jetCenter, jet.y);
         // The fall is measured from the jet, so it may pass through the player
         // or the decor on the way down; only the blast itself is dangerous.
@@ -109,8 +109,8 @@ export function stepThreats(threats, world, player, dt, time) {
           vy: 0,
           g: (2 * Math.max(MIN_DROP, drop)) / (BOMB_WARNING * BOMB_WARNING),
           targetY,
-          w: 0.55,
-          h: 0.8,
+          w: BOMB_W,
+          h: BOMB_H,
           droppedAt: time,
         });
         jet.dropped = true;
@@ -120,7 +120,7 @@ export function stepThreats(threats, world, player, dt, time) {
   }
 
   // Remove jets that have flown out of the world.
-  threats.jets = threats.jets.filter((jet) => Math.abs(jet.x - player.x) < 45);
+  threats.jets = threats.jets.filter((jet) => Math.abs(jet.x - player.x) < JET_CULL_DISTANCE);
 
   // Bombs fall straight down and explode on the first solid surface.
   for (const bomb of threats.bombs) {
@@ -131,7 +131,7 @@ export function stepThreats(threats, world, player, dt, time) {
       bomb.y = bomb.targetY;
       explode(threats, world, player, bomb, time, events);
       bomb.dead = true;
-    } else if (bomb.y < world.lowestTop - 30) {
+    } else if (bomb.y < world.lowestTop - VOID_MARGIN) {
       bomb.dead = true; // fell into the void without a blast
     }
   }
