@@ -24,4 +24,10 @@ Index of all learning files. Format per entry:
 
 - [gh repo view --json does not expose REST field names](gh-repo-view-json-field-names.md) — Keywords: gh CLI, GitHub API, json fields, repo metadata (verified, 2026-11-10)
 
+- [Rewriting a file from a remembered version loses committed work](verify-file-base-before-rewriting.md) — Keywords: refactor, git show HEAD, whole file rewrite, compare output (verified, 2026-11-10)
+
+- [A renamed constant crashes only when something draws it](half-applied-constant-rename.md) — Keywords: constants, rename, ReferenceError, check-constants, draw path (verified, 2026-11-10)
+
+- [A module split breaks the standalone bundle twice](module-split-breaks-standalone-bundle.md) — Keywords: standalone build, module graph, duplicate const, script scope, re-export (verified, 2026-11-10)
+
 New files start from `_template.md`. Do not list `_template.md` here.
